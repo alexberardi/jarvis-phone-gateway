@@ -46,6 +46,9 @@ class MediaStreamSession:
         vad: RmsVad,
         turn_pipeline: TurnPipeline,
         pending: PendingSession,
+        *,
+        recorder: Any | None = None,
+        on_stream_start: Callable[["MediaStreamSession"], Awaitable[None]] | None = None,
     ):
         self.ws = ws
         self.provider = provider
@@ -59,6 +62,13 @@ class MediaStreamSession:
         self.hangup_requested = False
         self.turn_no = 0
         self.marks_received: list[str] = []
+        # Optional local-recording tap (PRD decision 9): inbound frames and
+        # outbound bursts both flow through this session, so it is the one
+        # place a complete two-direction recording can be captured.
+        self.recorder = recorder
+        # Fired once after a VALIDATED stream-start — where the runtime
+        # speaks the (pre-synthesized) disclosure and marks the call in_call.
+        self.on_stream_start = on_stream_start
 
     async def run(self) -> None:
         """Drive the stream until stop/disconnect. Caller has already
@@ -82,9 +92,15 @@ class MediaStreamSession:
                         "Media stream started session=%s callSid=%s",
                         self.session_id, self.call_sid,
                     )
+                    if self.on_stream_start is not None:
+                        await self.on_stream_start(self)
+                        if self.hangup_requested:
+                            return
                 elif isinstance(event, InboundAudio):
                     if self.stream_sid is None:
                         continue  # media before start — ignore
+                    if self.recorder is not None:
+                        self.recorder.add_inbound(event.pcm)
                     utterance = self.vad.feed(event.pcm, suppress=self.speaking)
                     if utterance is not None:
                         await self._run_turn(utterance)
@@ -117,6 +133,8 @@ class MediaStreamSession:
             return
         self.speaking = True
         try:
+            if self.recorder is not None:
+                self.recorder.add_outbound(pcm_8k)
             for msg in self.provider.media_messages(self.stream_sid, pcm_8k):
                 await self.ws.send_json(msg)
             await self.ws.send_json(
