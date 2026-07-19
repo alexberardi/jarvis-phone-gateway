@@ -19,6 +19,11 @@ services:
       - ./.env:/app/.env
     env_file:
       - .env
+      # Stack env managed by the ./jarvis CLI — the admin service-credentials
+      # panel writes TWILIO_* here; listed second so it wins over repo .env
+      # placeholders. Optional: machines without an installed stack still work.
+      - path: ${HOME}/.jarvis/compose/.env
+        required: false
     environment:
       - PYTHONUNBUFFERED=1
     extra_hosts:
