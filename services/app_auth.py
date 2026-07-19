@@ -52,7 +52,9 @@ async def require_app_auth(
         )
     try:
         async with httpx.AsyncClient(timeout=5.0) as http:
-            r = await http.post(
+            # app-ping is a GET (jarvis_auth/app/api/internal.py) — POSTing
+            # gets 405 and read as invalid, failing every inbound call closed.
+            r = await http.get(
                 f"{auth_url.rstrip('/')}/internal/app-ping",
                 headers={
                     "X-Jarvis-App-Id": x_jarvis_app_id,
