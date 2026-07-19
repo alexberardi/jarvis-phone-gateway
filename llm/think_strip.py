@@ -63,3 +63,17 @@ class ThinkStripper:
             return ""
         out, self._buf = self._buf, ""
         return out
+
+
+def strip_think_text(text: str) -> str:
+    """Strip <think> blocks from COMPLETE (non-streamed) text.
+
+    For non-streaming responses (e.g. the wrapup summary) — found live
+    2026-07-19: the background model's chain-of-thought leaked verbatim into
+    the outcome card. Unclosed blocks are stripped to the end.
+    """
+    import re
+
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*\Z", "", text, flags=re.DOTALL)
+    return text.strip()

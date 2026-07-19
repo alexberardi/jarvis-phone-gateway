@@ -80,6 +80,20 @@ def build_system_prompt(session: dict[str, Any]) -> str:
         "confirmed (e.g. [OUTCOME: booked Friday 7pm party of 4 under Alex]).\n"
         "When the goal is achieved or clearly impossible, confirm, record the "
         "[OUTCOME: ...], say goodbye, and emit [HANGUP].",
+        # Live finding 2026-07-19: the agent hung up the moment it answered a
+        # question ("no soda, thanks" → click) with the order never confirmed.
+        "Ending the call — follow this strictly:\n"
+        "- The goal is NOT achieved just because you stated it or answered a "
+        "question. For an order, wait until the business confirms the order "
+        "and gives a total or ready time; for a booking, wait until they "
+        "confirm the date, time, and name back to you.\n"
+        "- Never emit [HANGUP] in the same reply where you answered their "
+        "question — let them respond; they usually still need to confirm.\n"
+        "- Only hang up after the confirmed result is recorded with "
+        "[OUTCOME: ...] and you have said a brief, natural goodbye — or "
+        "after the other person indicates the call is over.\n"
+        "- Do not repeat details you already stated (address, payment) "
+        "unless asked to.",
     ]
     return "\n\n".join(s for s in sections if s)
 
