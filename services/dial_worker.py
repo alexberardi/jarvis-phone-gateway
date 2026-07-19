@@ -33,6 +33,7 @@ import httpx
 import numpy as np
 
 from config import GatewayConfig
+from llm.think_strip import strip_think_text
 from llm.client import LlmProxyStreamClient
 from queues.dial_queue import DialJob, DialQueue
 from services.escalation import EscalationWindow
@@ -53,7 +54,7 @@ _HANGUP_GRACE_S = 10.0
 _SUMMARY_INSTRUCTION = (
     "Summarize this phone call in two sentences for the person it was made "
     "on behalf of. State plainly whether the goal was achieved. Do not "
-    "invent details."
+    "invent details. /no_think"
 )
 
 
@@ -327,10 +328,11 @@ class DialWorker:
             "audio_available": audio_key is not None,
         }
         try:
+            # CC lands the session terminal from the outcome event itself —
+            # a trailing state event just 409s (observed live).
             await self.session_client.outcome_event(
                 session_id, outcome, http=http, audio_key=audio_key
             )
-            await self.session_client.state_event(session_id, "done", http=http)
         except Exception as e:  # noqa: BLE001 — last resort: log loudly
             logger.error("Outcome/done report failed for %s: %s", session_id, e)
 
@@ -354,7 +356,9 @@ class DialWorker:
             )
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
-            return str(content).strip() or "Call completed."
+            # The background model may be a thinking model — never let
+            # chain-of-thought reach the outcome card.
+            return strip_think_text(str(content)) or "Call completed."
         except Exception as e:  # noqa: BLE001
             logger.error("Wrapup summary failed: %s", e)
             facts = "; ".join(pipeline.outcome_facts)

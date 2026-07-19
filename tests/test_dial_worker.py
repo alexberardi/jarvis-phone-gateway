@@ -202,7 +202,9 @@ class TestHappyPath:
         assert "wss://calls.example.com/media/" in twiml
         assert "sess-1" in twiml
 
-        # Lifecycle order: claim -> in_call -> wrapup -> outcome -> done.
+        # Lifecycle order: claim -> in_call -> wrapup -> outcome. CC lands
+        # the session terminal from the outcome event itself; a trailing
+        # "done" state event would 409 (observed live 2026-07-19).
         assert cc.events[0][0] == "claim"
         states = cc.states()
         assert states.index("in_call") < states.index("wrapup")
@@ -210,7 +212,8 @@ class TestHappyPath:
         assert outcome[1]["summary"] == "Booked Friday 7pm."
         assert outcome[1]["audio_available"] is True
         assert outcome[2] == "hh-1/sess-1.wav"
-        assert states[-1] == "done"
+        assert states[-1] == "wrapup"
+        assert cc.events[-1][0] == "outcome"
 
         # Runtime cleaned up.
         assert runtimes == {}
