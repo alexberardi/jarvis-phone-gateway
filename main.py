@@ -255,7 +255,11 @@ def create_app(
         try:
             import redis  # deferred: chat-only deployments run without it
 
-            redis_client = redis.Redis.from_url(cfg.redis_url)
+            # socket_timeout must exceed the worker's BLPOP block (5 s) or
+            # every idle pop dies with "Timeout reading from socket".
+            redis_client = redis.Redis.from_url(
+                cfg.redis_url, socket_timeout=15, socket_connect_timeout=5
+            )
         except Exception as e:  # noqa: BLE001 — no Redis ⇒ no dialing, app still serves
             logger.warning("Redis unavailable (%s) — dial worker not started", e)
             return

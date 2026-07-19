@@ -105,7 +105,17 @@ class DialWorker:
         self._running = False
 
     def _client(self) -> httpx.AsyncClient:
-        return self._http or httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5))
+        # Default app-auth headers so EVERY outbound hop (whisper /transcribe,
+        # tts /speak/stream, …) authenticates — found live 2026-07-19: bare
+        # calls got 401 from tts, which correctly blocked dialing at the
+        # disclosure synth (stub-backed tests never enforced auth).
+        return self._http or httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5),
+            headers={
+                "X-Jarvis-App-Id": self.cfg.app_id,
+                "X-Jarvis-App-Key": self.cfg.app_key,
+            },
+        )
 
     # ------------------------------------------------------------ loop
 
