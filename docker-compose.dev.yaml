@@ -1,0 +1,28 @@
+# Dev compose — the gateway is NOT GPU-dependent, so unlike llm-proxy/ocr it
+# runs in Docker on every platform, macOS included. Host services (config,
+# auth, CC, tts, redis, minio) are reached via host.docker.internal; the
+# cloudflared tunnel on the host points at the published :7713.
+services:
+  jarvis-phone-gateway:
+    build: .
+    container_name: jarvis-phone-gateway
+    ports:
+      - "${SERVER_PORT:-7713}:7713"
+    volumes:
+      - ./audio:/app/audio
+      - ./llm:/app/llm
+      - ./queues:/app/queues
+      - ./services:/app/services
+      - ./telephony:/app/telephony
+      - ./config.py:/app/config.py
+      - ./main.py:/app/main.py
+      - ./.env:/app/.env
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    extra_hosts:
+      - "${DOCKER_HOST_ALIAS:-host.docker.internal}:host-gateway"
+    command: >
+      sh -c "uvicorn main:app --host 0.0.0.0 --port 7713 --reload"
+    restart: unless-stopped
