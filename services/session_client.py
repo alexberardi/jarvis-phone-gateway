@@ -102,6 +102,15 @@ class SessionClient:
     async def heartbeat(self, session_id: str, *, http: httpx.AsyncClient) -> None:
         await self._post_event(session_id, {"type": "heartbeat"}, http=http)
 
+    async def escalation_event(
+        self, session_id: str, question: str, *, http: httpx.AsyncClient
+    ) -> None:
+        """Mid-call escalation: CC turns this into the push + inbox card whose
+        answer comes back over POST /internal/call/{id}/escalation-answer."""
+        await self._post_event(
+            session_id, {"type": "escalation", "question": question}, http=http
+        )
+
     async def outcome_event(
         self,
         session_id: str,
