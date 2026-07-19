@@ -1,0 +1,55 @@
+name: Integration Trigger (from-source)
+
+# Fires a repository_dispatch at jarvis-integration-tests when a PR opens or is
+# updated here, so the cross-service FROM-SOURCE lane builds THIS service from
+# the PR's source into the real command-center + auth + config stack and runs
+# the real round-trip cases (CASE-301/302 for llm-proxy), instead of the PR only
+# seeing its own unit tests. Receiver:
+# jarvis-integration-tests/.github/workflows/from-source-services.yml
+# (event type `from-source-integration`).
+#
+# Green-idle until the dispatch token is configured:
+#   INTEGRATION_DISPATCH_TOKEN — fine-grained PAT scoped to
+#     `Contents: read` + `repository_dispatch` (write) on
+#     alexberardi/jarvis-integration-tests ONLY. Until it's set, this job warns
+#     and passes (it does not fail PRs).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+jobs:
+  dispatch:
+    # Dependabot PRs run with a SEPARATE secrets store, so the cross-repo PAT
+    # resolves to an empty string and `gh` exits 4 ("set the GH_TOKEN env
+    # variable"). The dependency bump itself is fine — the `test` job passes —
+    # so don't fail the PR on a dispatch that cannot work by design.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Dispatch from-source integration run
+        env:
+          GH_TOKEN: ${{ secrets.INTEGRATION_DISPATCH_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ORIGINATING_REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning title=Integration trigger idle::INTEGRATION_DISPATCH_TOKEN is not set; skipping the from-source integration dispatch. Add a repository_dispatch-scoped PAT for alexberardi/jarvis-integration-tests to enable it."
+            exit 0
+          fi
+          # source_repo + head_sha tell the receiver to build THIS PR's exact
+          # commit from source (the from-source overlay's build.context). For a
+          # same-repo PR head_sha is reachable on originating_repo; fork PRs
+          # aren't supported (the dispatch token wouldn't reach the fork anyway).
+          gh api \
+            --method POST \
+            /repos/alexberardi/jarvis-integration-tests/dispatches \
+            -f "event_type=from-source-integration" \
+            -f "client_payload[service]=jarvis-phone-gateway" \
+            -f "client_payload[pr_number]=$PR_NUMBER" \
+            -f "client_payload[head_sha]=$HEAD_SHA" \
+            -f "client_payload[originating_repo]=$ORIGINATING_REPO" \
+            -f "client_payload[source_repo]=$ORIGINATING_REPO"

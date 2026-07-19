@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+tests/
+.github/
+README.md
+CLAUDE.md
+env.template
+run.sh
