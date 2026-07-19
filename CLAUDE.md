@@ -51,10 +51,17 @@ CC /internal/phone/sessions/{id}/events     └─▶ tts /speak/stream (guarded
 | `llm/tool_tokens.py` | `[HANGUP]` `[ESCALATE:]` `[OUTCOME:]` `[DTMF:]` streaming parser |
 | `llm/think_strip.py` | `<think>` block stripping on the token stream |
 | `services/tts_guard.py` | TTS content-type gate + per-response sample rate + odd-byte-safe PCM chunking |
-| `services/session_client.py` | CC contract: claim_dial CAS, state/turn/heartbeat/outcome events |
-| `services/media_stream.py` | Per-call session: WS loop composing codec + VAD + turn pipeline |
+| `services/session_client.py` | CC contract: claim_dial CAS, state/turn/heartbeat/escalation/outcome events |
+| `services/media_stream.py` | Per-call session: WS loop composing codec + VAD + turn pipeline (+ recorder tap, on-stream-start disclosure hook) |
+| `services/prompt.py` | Disclosure + system prompt: the compliance strings (AI+recording notice, honest-robot, no-payment, tool tokens) |
+| `services/turn_pipeline.py` | **The live chain**: whisper → llm (think-strip → tool tokens → sentences) → tts guard → 8 kHz PCM; per-turn stage timings; escalation handling |
+| `services/escalation.py` | Bounded (~25 s) escalation window; one at a time; timeout ⇒ callback line + graceful end |
+| `services/dial_worker.py` | Job → CC claim → disclosure prewarm → TwiML/dial → heartbeats + max_call_seconds watchdog → wrapup summary + outcome |
+| `services/recording.py` | Two-direction local mix (inbound-clocked) → WAV → MinIO; notice-off ⇒ never constructed |
+| `services/app_auth.py` | Inbound app-to-app auth for /internal/* (round-trip to jarvis-auth, fail-closed, 60 s cache) |
+| `services/line_lookup.py` | Twilio Lookup v2 line-type proxy for CC's resolve step (errors ⇒ "unknown") |
 | `queues/dial_queue.py` | `phone:dial` consumer, strict job parsing |
-| `main.py` | `create_app()` factory: /health + `/media/{token}` with the three WS gates |
+| `main.py` | `create_app()` factory: /health, `/media/{token}` (three WS gates), `/internal/call/{id}/escalation-answer` + `/cancel`, `/internal/lookup/line-type`; startup: discovery + dial worker |
 | `config.py` | Env config (bootstrap + secrets only) |
 
 ---
@@ -102,6 +109,22 @@ CC /internal/phone/sessions/{id}/events     └─▶ tts /speak/stream (guarded
    the signature-verification key.
 10. **Ingress is a named Cloudflare tunnel hostname** — quick tunnels proved
     unfit during P0 (LAN DNS interference, config hijack, edge flakes).
+11. **The disclosure is never skippable** (PRD decision 10). It is
+    pre-synthesized during dialing (prewarm) and spoken on validated
+    stream-start; if TTS can't produce it, the worker marks the session
+    failed and never dials. It also seeds the message history as the first
+    assistant turn so the model doesn't re-introduce itself.
+12. **Notice-off ⇒ nothing conversational persists** (PRD decision 9):
+    `session["record_enabled"] == False` means no recorder is constructed,
+    turn events to CC carry timings only (no heard/said), and the in-memory
+    history exists solely for the wrapup summary.
+13. **CC being down never kills a live call.** Turn events are
+    fire-and-forget; heartbeats/state posts log-and-continue. The only CC
+    call that gates anything is the pre-dial claim CAS.
+14. **The escalation window is bounded and single.** ~25 s wait; timeout ⇒
+    "I'll check and call you back" + graceful hangup — this degradation IS
+    the expected P1 path (lock-screen actions are P2). Answers arrive via
+    `POST /internal/call/{id}/escalation-answer` (app-auth).
 
 ---
 
@@ -128,10 +151,13 @@ CC /internal/phone/sessions/{id}/events     └─▶ tts /speak/stream (guarded
 |---|---|
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM_NUMBER` | Telephony credentials (gateway-only) |
 | `PUBLIC_URL` | This worker's public https base (named tunnel); TwiML wss URLs + signature checks derive from it |
-| `CC_BASE_URL` / `WHISPER_URL` / `LLM_URL` / `TTS_URL` | Upstream services |
+| `PUBLIC_WSS_URL` | Optional explicit wss base (default: PUBLIC_URL with https→wss) |
+| `CC_BASE_URL` / `WHISPER_URL` / `LLM_URL` / `TTS_URL` | Upstream services (env fallbacks; config-service discovery overrides at startup when the client is installed) |
 | `JARVIS_APP_ID` / `JARVIS_APP_KEY` | App-to-app credentials (gateway gets its own pair in jarvis-auth) |
-| `JARVIS_CONFIG_URL` | Service discovery (wiring TODO) |
-| `REDIS_URL` | Dial queue |
+| `JARVIS_AUTH_URL` | jarvis-auth base for inbound app-auth round-trips |
+| `JARVIS_CONFIG_URL` | Service discovery |
+| `REDIS_URL` / `RUN_DIAL_WORKER` | Dial queue; worker starts at boot iff Redis is reachable and not disabled |
+| `S3_ENDPOINT_URL` / `AWS_*` / `S3_FORCE_PATH_STYLE` / `PHONE_CALLS_BUCKET` | Recording storage (MinIO) |
 | `SERVER_HOST` / `SERVER_PORT` (7713) | Bind |
 | `VAD_RMS` (250) | Endpointing threshold |
 
@@ -140,21 +166,21 @@ settings DB and are CC-owned; the gateway learns them via session payloads.
 
 ---
 
-## TODO — live-wiring phase (deliberately not built yet)
+## TODO — remaining (post-live-loop)
 
-- The real turn pipeline: whisper → llm client (+ think strip + tool tokens)
-  → tts guard → `MediaStreamSession.speak`, with per-turn stage timings
-  emitted via `SessionClient.turn_event` (the observability section's
-  metrics.json format).
-- Dial worker loop: `DialQueue.pop` → `claim_for_dial` → issue token →
-  `build_stream_instructions` → `start_call` → reaper-friendly heartbeats.
-- Local recording (both directions) → mixed WAV → MinIO, and the outcome
-  event carrying the audio key.
-- Disclosure first turn + system prompt assembly from the session's details
-  brief (guardrail boundary: the brief is all the agent may say).
-- `jarvis-config-client` discovery + `JarvisLogger` (jarvis-log-client)
-  wiring; `settings_definitions.py` if any gateway-local settings emerge.
-- Escalation/cancel inbound endpoints (`/internal/call/{session_id}/...`)
-  once the CC side of the contract exists.
-- Service-integration checklist (config-service `known_services.py`, `jarvis`
-  CLI arrays, installer/admin compose generators, jarvis-auth app pair).
+The live-wiring phase (turn pipeline, dial worker, recording, disclosure,
+escalation/cancel endpoints, discovery/logging) landed with
+`feat/live-call-loop`. Still open:
+
+- **Live smoke against real Twilio** (manual, ~2¢): dial Alex's cell from the
+  dev stack — the P1 exit test. Requires CC's `/internal/phone/*` endpoints
+  (CC-side P1 work, in flight) + Twilio creds + the named tunnel.
+- Barge-in (`clear` + `mark` + context truncation) — P2; provider messages
+  exist.
+- Replay fixtures from the spike utterance WAVs for the turn pipeline
+  (current tests stub the STT seam; replay adds real-audio coverage).
+- Service-integration checklist remainder: config-service
+  `known_services.py`, `jarvis` CLI arrays, jarvis-auth app pair
+  provisioning (installer/admin compose entries already landed).
+- `settings_definitions.py` if any gateway-local settings emerge (today all
+  `phone_calls.*` knobs are CC-owned and arrive via session payloads).
