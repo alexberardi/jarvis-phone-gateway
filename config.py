@@ -34,6 +34,25 @@ class GatewayConfig:
     host: str = field(default_factory=lambda: os.getenv("SERVER_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: int(os.getenv("SERVER_PORT", "7713")))
     vad_rms: float = field(default_factory=lambda: float(os.getenv("VAD_RMS", "250")))
+    auth_url: str = field(default_factory=lambda: os.getenv("JARVIS_AUTH_URL", "http://localhost:7701"))
+    # Explicit wss base for TwiML, else derived from public_url (https→wss).
+    _public_wss_url: str = field(
+        default_factory=lambda: os.getenv("PUBLIC_WSS_URL", "").rstrip("/")
+    )
+    run_dial_worker: bool = field(
+        default_factory=lambda: os.getenv("RUN_DIAL_WORKER", "true").lower()
+        in ("1", "true", "yes")
+    )
+
+    @property
+    def public_wss_url(self) -> str:
+        if self._public_wss_url:
+            return self._public_wss_url
+        if self.public_url.startswith("https://"):
+            return "wss://" + self.public_url[len("https://"):]
+        if self.public_url.startswith("http://"):
+            return "ws://" + self.public_url[len("http://"):]
+        return self.public_url
 
     @property
     def signature_validation_enabled(self) -> bool:
