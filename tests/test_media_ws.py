@@ -190,3 +190,127 @@ class TestSignatureGate:
                 f"/media/{token2}", headers={"X-Twilio-Signature": "forged"}
             ):
                 pass
+
+
+class TestFinalPlaybackDrain:
+    """`speak` only QUEUES audio; Twilio echoes a mark when it has actually
+    played. Returning straight from a hangup turn closed the socket
+    mid-sentence — live 2026-07-20, every completed call clipped its goodbye.
+    """
+
+    @staticmethod
+    def _session(queued: list[dict]):
+        import asyncio
+
+        from audio.vad import RmsVad
+        from services.media_stream import MediaStreamSession
+        from telephony.twilio_provider import PendingSession, TwilioProvider
+
+        class FakeWs:
+            def __init__(self, msgs):
+                self.msgs = list(msgs)
+                self.reads = 0
+
+            async def receive_text(self):
+                self.reads += 1
+                if not self.msgs:
+                    await asyncio.sleep(60)  # would hang -> timeout path
+                return json.dumps(self.msgs.pop(0))
+
+        async def _pipeline(utterance, session):
+            return None
+
+        ws = FakeWs(queued)
+        sess = MediaStreamSession(
+            ws, TwilioProvider("AC1", "", "+15555550100"), RmsVad(TEST_VAD), _pipeline,
+            PendingSession(session_id="s1", call_sid="CA1"),
+        )
+        sess.stream_sid = "MZ1"
+        return sess, ws
+
+    @pytest.mark.asyncio
+    async def test_waits_for_the_mark_of_the_last_buffer(self):
+        sess, ws = self._session([
+            {"event": "media", "media": {"payload": base64.b64encode(
+                ulaw_encode(QUIET)).decode()}},           # unrelated traffic first
+            {"event": "mark", "mark": {"name": "t3"}},    # the one we want
+        ])
+        sess.turn_no = 3
+        sess._pending_mark = "t3"
+
+        await sess._await_playback()
+
+        assert "t3" in sess.marks_received
+        assert ws.reads == 2, "should have drained past the unrelated frame"
+
+    @pytest.mark.asyncio
+    async def test_returns_immediately_if_mark_already_seen(self):
+        sess, ws = self._session([])
+        sess._pending_mark = "t1"
+        sess.marks_received.append("t1")
+
+        await sess._await_playback()
+
+        assert ws.reads == 0, "waited on a mark that had already arrived"
+
+    @pytest.mark.asyncio
+    async def test_gives_up_rather_than_wedging_the_call(self):
+        sess, ws = self._session([])
+        sess._pending_mark = "t1"
+        sess.FINAL_PLAYBACK_TIMEOUT_S = 0.05
+
+        await sess._await_playback()
+
+        assert "t1" not in sess.marks_received  # timed out, closed anyway
+
+    @pytest.mark.asyncio
+    async def test_run_drains_the_mark_before_returning_on_hangup(self):
+        """Pins the WIRING, not just the helper: a hangup turn must not let
+        `run` return until the final buffer's mark has come back.
+
+        Deleting the `_await_playback()` call from `run` must fail this — the
+        earlier helper-only tests happily passed without it.
+        """
+        import asyncio
+
+        from audio.vad import RmsVad
+        from services.media_stream import MediaStreamSession
+        from telephony.twilio_provider import PendingSession, TwilioProvider
+
+        script = [start_msg("s1")]
+        script += [media_msg(LOUD)] * 6      # speech
+        script += [media_msg(QUIET)] * 8     # endpoint it
+        script += [{"event": "mark", "mark": {"name": "t1"}}]
+
+        class FakeWs:
+            def __init__(self, msgs):
+                self.msgs = list(msgs)
+                self.sent: list[dict] = []
+
+            async def receive_text(self):
+                if not self.msgs:
+                    await asyncio.sleep(60)   # nothing left: only the drain waits
+                return json.dumps(self.msgs.pop(0))
+
+            async def send_json(self, msg):
+                self.sent.append(msg)
+
+            async def close(self, code=1000):
+                pass
+
+        async def _pipeline(utterance, session):
+            session.request_hangup()
+            return np.zeros(160, dtype=np.int16)
+
+        ws = FakeWs(script)
+        sess = MediaStreamSession(
+            ws, TwilioProvider("AC1", "", "+15555550100"), RmsVad(TEST_VAD),
+            _pipeline, PendingSession(session_id="s1", call_sid="CA1"),
+        )
+
+        await asyncio.wait_for(sess.run(), timeout=5.0)
+
+        assert sess.hangup_requested
+        assert "t1" in sess.marks_received, (
+            "run() returned before the goodbye finished playing"
+        )

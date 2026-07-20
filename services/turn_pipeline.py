@@ -37,10 +37,14 @@ from llm.think_strip import ThinkStripper
 from llm.tool_tokens import Dtmf, Escalate, Hangup, Outcome, ToolTokenParser
 from services.escalation import EscalationWindow
 from services.prompt import (
+    EMPTY_REPLY_LINE,
     ESCALATION_FALLBACK_LINE,
+    FALLBACK_GOODBYE_LINE,
     HOLD_LINE,
     TURN_FAILURE_LINE,
     initial_messages,
+    sounds_like_farewell,
+    with_no_think,
 )
 from services.session_client import SessionClient
 from services.tts_guard import PcmChunkAdapter, validate_tts_response_headers
@@ -161,6 +165,9 @@ class LiveTurnPipeline:
         self.turn_timeout_s = turn_timeout_s
         self.messages: list[dict[str, str]] = initial_messages(session)
         self.outcome_facts: list[str] = []
+        # True once any turn has recorded an [OUTCOME]; gates the hangup that
+        # would otherwise fire on the same turn the outcome first appears.
+        self._outcome_recorded_earlier = False
         self.turn_records: list[TurnRecord] = []
         self.escalation_unanswered = False
         # Notice-off rule (PRD decision 9): with the recording notice
@@ -232,7 +239,8 @@ class LiveTurnPipeline:
         stt_ms = (time.monotonic() - t0) * 1000
         if not heard:
             return None
-        self.messages.append({"role": "user", "content": heard})
+        # Directive re-asserted per turn; the transcript records `heard` raw.
+        self.messages.append({"role": "user", "content": with_no_think(heard)})
 
         try:
             pcm, said, events, llm_ttft_ms, tts_ttfb_ms = await self._generate_reply(
@@ -253,6 +261,7 @@ class LiveTurnPipeline:
 
         event_names: list[str] = []
         hangup = False
+        outcome_this_turn = False
         escalate_q: str | None = None
         for ev in events:
             if isinstance(ev, Hangup):
@@ -260,6 +269,7 @@ class LiveTurnPipeline:
                 event_names.append("hangup")
             elif isinstance(ev, Outcome):
                 self.outcome_facts.append(ev.facts)
+                outcome_this_turn = True
                 event_names.append("outcome")
             elif isinstance(ev, Escalate):
                 escalate_q = ev.question
@@ -276,6 +286,57 @@ class LiveTurnPipeline:
                 pcm = np.concatenate([pcm, extra_pcm]) if len(pcm) else extra_pcm
             if extra_said:
                 said = f"{said} {extra_said}".strip()
+
+        # The goal is not achieved just because the model said it was. Live
+        # 2026-07-19 (food order) and 2026-07-20 (appointment): the model
+        # recorded the outcome and hung up in the SAME reply, before the
+        # business had confirmed anything — both calls ended with nothing
+        # actually booked. The prompt forbids this and the model did it twice,
+        # so enforce it here: the first outcome never ends the call. A hangup
+        # on any later turn is honoured, so this costs one extra exchange.
+        they_closed = sounds_like_farewell(heard)
+        if (
+            hangup
+            and outcome_this_turn
+            and not self._outcome_recorded_earlier
+            and not they_closed
+        ):
+            hangup = False
+            event_names.append("hangup_deferred")
+            logger.warning(
+                "Deferred [HANGUP] on turn %d for %s — outcome recorded this "
+                "same turn and they had not signed off, giving them a chance "
+                "to confirm",
+                turn_no, self.session_id,
+            )
+            # The goodbye still plays; we just hold the line briefly. If they
+            # had genuinely already confirmed and have nothing to add, the
+            # idle timer ends the call instead of burning the 600s cap.
+            arm = getattr(media_session, "arm_idle_hangup", None)
+            if arm is not None:
+                arm()
+        if outcome_this_turn:
+            self._outcome_recorded_earlier = True
+
+        # Never end the call, or hold the line, on silence. An empty reply is
+        # a successful generation with nothing speakable in it (control tokens
+        # only, or an unclosed <think> block the stripper discarded).
+        if not said.strip():
+            # An empty reply to "see you in 30 minutes, thank you" must not
+            # become "could you repeat that?" — that is what happened live on
+            # 2026-07-20 and it forced the shop to say goodbye twice.
+            if they_closed and not hangup:
+                hangup = True
+                event_names.append("closed_by_callee")
+            recovery = FALLBACK_GOODBYE_LINE if hangup else EMPTY_REPLY_LINE
+            logger.warning(
+                "Empty reply on turn %d for %s — speaking fallback %r",
+                turn_no, self.session_id, recovery,
+            )
+            pcm, _ = await self._speak_sentence(recovery)
+            said = recovery
+            self.messages.append({"role": "assistant", "content": said})
+            event_names.append("empty_reply")
 
         if hangup:
             media_session.request_hangup()
