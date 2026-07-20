@@ -107,6 +107,38 @@ class LlmProxyStreamClient:
             await self._cancel(http, request_id)
             raise TurnTimeout(request_id, turn_timeout_s) from None
 
+    async def complete(
+        self,
+        messages: list[dict],
+        *,
+        http: httpx.AsyncClient,
+        model: str = "live",
+        max_tokens: int = 64,
+        timeout_s: float = 10.0,
+    ) -> str:
+        """One short non-streaming completion, for classification side-calls.
+
+        Non-streaming IS OpenAI-shaped on llm-proxy (only the streaming path
+        diverges), so this reads choices[0] normally. Raises on anything
+        unexpected — callers of this path are guards, and a guard that
+        cannot tell "no" from "the server broke" is not a guard.
+        """
+        r = await http.post(
+            f"{self.base_url}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "max_tokens": max_tokens,
+            },
+            headers=self._headers,
+            timeout=httpx.Timeout(timeout_s, connect=5),
+        )
+        if r.status_code != 200:
+            raise LlmStreamError(f"llm-proxy returned {r.status_code} for completion")
+        body = r.json()
+        return (body["choices"][0]["message"]["content"] or "").strip()
+
     async def _cancel(self, http: httpx.AsyncClient, request_id: str) -> None:
         try:
             await http.post(

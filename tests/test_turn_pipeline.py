@@ -29,11 +29,25 @@ UTTERANCE = np.full(1600, 1500, dtype=np.int16)
 
 
 class FakeLlm:
-    """Scripted delta streams, one list per call."""
+    """Scripted delta streams, one list per call.
 
-    def __init__(self, scripts):
+    ``verdict``/``complete_error`` drive the guard's ask-classifier, which
+    rides the same client; ``completions`` records every call it makes, so a
+    test can assert the guard stayed off the wire when it had nothing to do.
+    """
+
+    def __init__(self, scripts, verdict="NONE", complete_error=None):
         self.scripts = list(scripts)
         self.calls: list[list[dict]] = []
+        self.verdict = verdict
+        self.complete_error = complete_error
+        self.completions: list[list[dict]] = []
+
+    async def complete(self, messages, *, http=None, **kw):
+        self.completions.append([dict(m) for m in messages])
+        if self.complete_error:
+            raise self.complete_error
+        return self.verdict
 
     async def stream_deltas(self, messages, *, http, turn_timeout_s=20.0, **kw):
         self.calls.append([dict(m) for m in messages])
@@ -416,3 +430,146 @@ class TestCalleeClosedTheCall:
 
         assert not media.hangup_requested
         assert "repeat" in " ".join(stub_services["synth"]).lower()
+
+
+class TestSpokenOutputGuard:
+    """End of the guard's chain: what actually reaches TTS.
+
+    The unit tests prove detection and intent in isolation; these prove the
+    pipeline honours the verdict, and that a withheld sentence never becomes
+    dead air or a silent hole in the transcript.
+    """
+
+    GUARDED = {
+        **SESSION,
+        "restricted_details": [
+            {
+                "key": "callback_number",
+                "label": "Callback number",
+                "value": "(908) 555-0147",
+            }
+        ],
+    }
+
+    def _pipeline(self, llm, cc=None):
+        return LiveTurnPipeline(
+            session=self.GUARDED,
+            whisper_url="http://w",
+            tts_url="http://t",
+            llm=llm,
+            http=None,
+            session_client=cc or FakeSessionClient(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_volunteered_number_never_reaches_tts(self, stub_services):
+        """The failure this exists for: a rule forbade it and the model did
+        it anyway. The rest of the reply still goes out."""
+        llm = FakeLlm([
+            ["We can do Friday at seven. ", "My callback number is 908-555-0147."]
+        ], verdict="NONE")
+        pipe = self._pipeline(llm)
+
+        stub_services["transcripts"] = "How many in your party?"
+        await pipe(UTTERANCE, media := FakeMediaSession())
+        await drain(pipe)
+
+        spoken = " ".join(stub_services["synth"])
+        assert "555" not in spoken and "0147" not in spoken
+        assert "Friday at seven" in spoken
+        assert "guard_suppressed" in pipe.turn_records[-1].events
+        assert not media.hangup_requested
+
+    @pytest.mark.asyncio
+    async def test_the_transcript_records_only_what_was_said(self, stub_services):
+        """A suppressed sentence must leave the model's own history too —
+        otherwise it believes it already gave the number and reasons from
+        that on every later turn."""
+        llm = FakeLlm([
+            ["Sure thing. ", "You can reach me at 908-555-0147."]
+        ], verdict="NONE")
+        pipe = self._pipeline(llm)
+
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        history = " ".join(
+            m["content"] for m in pipe.messages if m["role"] == "assistant"
+        )
+        assert "0147" not in history
+        assert "0147" not in pipe.turn_records[-1].said
+
+    @pytest.mark.asyncio
+    async def test_asked_for_it_lets_it_through(self, stub_services):
+        """The tier is give-if-asked, not never. Blocking a genuine request
+        would break the calls the feature exists to make."""
+        llm = FakeLlm([
+            ["Of course — it's 908-555-0147."]
+        ], verdict="1")
+        pipe = self._pipeline(llm)
+
+        stub_services["transcripts"] = "What's a good callback number for you?"
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert "908-555-0147" in " ".join(stub_services["synth"])
+        assert "guard_suppressed" not in pipe.turn_records[-1].events
+
+    @pytest.mark.asyncio
+    async def test_classifier_outage_suppresses_rather_than_leaks(self, stub_services):
+        llm = FakeLlm([
+            ["It's 908-555-0147."]
+        ], complete_error=RuntimeError("llm-proxy down"))
+        pipe = self._pipeline(llm)
+
+        stub_services["transcripts"] = "What's your callback number?"
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert "0147" not in " ".join(stub_services["synth"])
+
+    @pytest.mark.asyncio
+    async def test_fully_suppressed_reply_does_not_ask_them_to_repeat(
+        self, stub_services
+    ):
+        """"Could you repeat that?" would invite the same question and the
+        same suppression — a loop, on a live call."""
+        llm = FakeLlm([["My callback number is 908-555-0147."]], verdict="NONE")
+        pipe = self._pipeline(llm)
+
+        stub_services["transcripts"] = "And a number for you?"
+        await pipe(UTTERANCE, media := FakeMediaSession())
+        await drain(pipe)
+
+        spoken = " ".join(stub_services["synth"])
+        assert "0147" not in spoken
+        assert "repeat" not in spoken.lower()
+        assert "not able to share" in spoken.lower()
+        assert not media.hangup_requested
+
+    @pytest.mark.asyncio
+    async def test_a_call_with_no_restricted_details_never_calls_the_classifier(
+        self, stub_services
+    ):
+        """The common case must cost nothing — no extra round trip per turn."""
+        llm = FakeLlm([["We're all set for Friday."]], verdict="1")
+        pipe = make_pipeline(llm, FakeSessionClient())  # plain SESSION
+
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert llm.completions == []
+
+    @pytest.mark.asyncio
+    async def test_classifier_is_called_once_for_two_leaky_sentences(
+        self, stub_services
+    ):
+        llm = FakeLlm([
+            ["Reach me at 908-555-0147. ", "Again, that's 9085550147."]
+        ], verdict="NONE")
+        pipe = self._pipeline(llm)
+
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert len(llm.completions) == 1

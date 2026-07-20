@@ -48,6 +48,11 @@ TURN_FAILURE_LINE = "Sorry, I'm having a little trouble — could you say that a
 # reasoning into the call. Live 2026-07-20: that produced dead air on the turn
 # right after the business accepted the appointment, and the call never ended.
 EMPTY_REPLY_LINE = "Sorry — could you repeat that?"
+
+# Spoken when the guard withheld every sentence of a reply. Deliberately not
+# EMPTY_REPLY_LINE: "could you repeat that?" invites the callee to ask again,
+# and the guard would withhold the answer again — a loop, on a live call.
+GUARD_SUPPRESSED_LINE = "I'm sorry — I'm not able to share that."
 # Spoken when the model asks to hang up without leaving any speakable text,
 # so a call never terminates on silence.
 FALLBACK_GOODBYE_LINE = "Thank you very much — goodbye."
