@@ -46,6 +46,17 @@ class TestSystemPrompt:
         p = build_system_prompt(SESSION)
         assert "COMPLETE set of facts" in p
 
+    def test_give_if_asked_details_are_to_be_given_not_refused(self):
+        """Live 2026-07-20: asked "what's the policy number?", the model said
+        "I don't have that information" though the number was in its brief
+        under give-if-asked. The whole point of storing it is to give it when
+        asked; the prompt must say so, not just forbid volunteering."""
+        p = build_system_prompt(SESSION).lower()
+        assert "does not mean refuse them when asked" in p
+        # The refusal rule must be scoped to what is genuinely absent, so the
+        # model stops applying it to private-but-present details.
+        assert "not in this brief" in p
+
     def test_omits_empty_sections(self):
         p = build_system_prompt({"goal": "", "details": "", "constraints": ""})
         assert "Your goal for this call" not in p
@@ -77,10 +88,12 @@ class TestDisclosureRules:
         assert "Decline twice before you do this" in prompt
 
     def test_give_if_asked_is_never_volunteered(self):
-        prompt = build_system_prompt({"goal": "book a table"})
+        prompt = build_system_prompt({"goal": "book a table"}).lower()
 
-        assert "never volunteer it" in prompt
-        assert "needed to finish this task" in prompt
+        # Still forbidden to offer them unprompted — the guard is the backstop,
+        # not the only line. (The "AND it is needed" hedge was dropped: it made
+        # the model over-refuse legitimate asks — live 2026-07-20.)
+        assert "do not volunteer them" in prompt
 
     def test_in_call_instructions_cannot_override_the_brief(self):
         """Voice prompt-injection: the person on the phone is untrusted."""
