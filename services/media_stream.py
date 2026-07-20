@@ -14,7 +14,9 @@ playback echo.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 import numpy as np
@@ -39,6 +41,20 @@ CLOSE_BAD_BINDING = 4403
 
 
 class MediaStreamSession:
+    # Upper bound on waiting for the provider to confirm the final buffer
+    # played. Generous enough for a long goodbye, short enough that a lost
+    # mark can't wedge the call open.
+    FINAL_PLAYBACK_TIMEOUT_S = 10.0
+    # After a deferred hangup we stay on the line to let the other party
+    # confirm. If they say nothing, the call must still end — without this the
+    # only backstop is DEFAULT_MAX_CALL_SECONDS (600s) of billed silence.
+    #
+    # Kept SHORT. This window is pure dead air on the wire, and the agent has
+    # usually just said goodbye. At 8s (2026-07-20) the shop hung up on us
+    # first, which reads as the agent failing to end the call. A couple of
+    # seconds is a natural end-of-call pause; longer is a silence.
+    IDLE_HANGUP_SECONDS = 2.5
+
     def __init__(
         self,
         ws: WebSocket,
@@ -62,6 +78,11 @@ class MediaStreamSession:
         self.hangup_requested = False
         self.turn_no = 0
         self.marks_received: list[str] = []
+        # Mark name for the most recent spoken buffer, awaited before hangup.
+        self._pending_mark: str | None = None
+        # Absolute deadline after which an idle call ends itself; armed only
+        # when a hangup was deferred waiting for the other party to confirm.
+        self._idle_deadline: float | None = None
         # Optional local-recording tap (PRD decision 9): inbound frames and
         # outbound bursts both flow through this session, so it is the one
         # place a complete two-direction recording can be captured.
@@ -95,16 +116,31 @@ class MediaStreamSession:
                     if self.on_stream_start is not None:
                         await self.on_stream_start(self)
                         if self.hangup_requested:
+                            await self._await_playback()
                             return
                 elif isinstance(event, InboundAudio):
                     if self.stream_sid is None:
                         continue  # media before start — ignore
                     if self.recorder is not None:
                         self.recorder.add_inbound(event.pcm)
+                    if (
+                        self._idle_deadline is not None
+                        and time.monotonic() > self._idle_deadline
+                        and not self.speaking
+                    ):
+                        logger.warning(
+                            "Idle %.1fs after deferred hangup on session %s "
+                            "— ending the call",
+                            self.IDLE_HANGUP_SECONDS, self.session_id,
+                        )
+                        self.hangup_requested = True
+                        return
                     utterance = self.vad.feed(event.pcm, suppress=self.speaking)
                     if utterance is not None:
+                        self._idle_deadline = None  # they spoke; let the turn run
                         await self._run_turn(utterance)
                         if self.hangup_requested:
+                            await self._await_playback()
                             return
                 elif isinstance(event, MarkReceived):
                     self.marks_received.append(event.name)
@@ -137,11 +173,64 @@ class MediaStreamSession:
                 self.recorder.add_outbound(pcm_8k)
             for msg in self.provider.media_messages(self.stream_sid, pcm_8k):
                 await self.ws.send_json(msg)
+            mark = f"t{self.turn_no}"
+            self._pending_mark = mark
             await self.ws.send_json(
-                self.provider.mark_message(self.stream_sid, f"t{self.turn_no}")
+                self.provider.mark_message(self.stream_sid, mark)
             )
         finally:
             self.speaking = False
+
+    def arm_idle_hangup(self, seconds: float | None = None) -> None:
+        """End the call if the other party stays silent for `seconds`.
+
+        Used after a deferred hangup: the agent has said its goodbye but is
+        holding the line for a confirmation that may never come.
+        """
+        self._idle_deadline = time.monotonic() + (
+            self.IDLE_HANGUP_SECONDS if seconds is None else seconds
+        )
+
+    async def _await_playback(self) -> None:
+        """Block until the provider confirms the last buffer finished playing.
+
+        ``speak`` only QUEUES frames onto the websocket; Twilio plays them
+        asynchronously and echoes the mark when the audio has actually been
+        heard. Returning straight from a hangup turn therefore closed the
+        socket mid-sentence and the caller heard a click (live 2026-07-20:
+        the goodbye was cut off on every completed call). Marks arrive on the
+        same event stream as everything else, so this keeps draining events
+        rather than waiting on a future nothing would resolve.
+        """
+        mark = self._pending_mark
+        if mark is None or mark in self.marks_received:
+            return
+        deadline = time.monotonic() + self.FINAL_PLAYBACK_TIMEOUT_S
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "Timed out waiting for playback of %s on session %s — "
+                    "closing anyway", mark, self.session_id,
+                )
+                return
+            try:
+                raw = await asyncio.wait_for(
+                    self.ws.receive_text(), timeout=remaining
+                )
+            except (asyncio.TimeoutError, WebSocketDisconnect):
+                return
+            event = self.provider.parse_ws_message(raw)
+            if isinstance(event, MarkReceived):
+                self.marks_received.append(event.name)
+                if event.name == mark:
+                    return
+            elif isinstance(event, InboundAudio):
+                # Keep the recording complete through the goodbye.
+                if self.recorder is not None:
+                    self.recorder.add_inbound(event.pcm)
+            elif isinstance(event, StreamStop):
+                return
 
     def request_hangup(self) -> None:
         """Turn pipeline signals the call should end after this turn."""
