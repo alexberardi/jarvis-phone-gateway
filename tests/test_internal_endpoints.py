@@ -187,7 +187,7 @@ class TestLineTypeEndpoint:
         app = make_app()
         allow_auth(app)
         r = TestClient(app).post(
-            "/internal/lookup/line-type", json={"number": "+19082781811"}
+            "/internal/lookup/line-type", json={"number": "+15555550123"}
         )
         assert r.status_code == 200
-        assert r.json() == {"number": "+19082781811", "line_type": "unknown"}
+        assert r.json() == {"number": "+15555550123", "line_type": "unknown"}

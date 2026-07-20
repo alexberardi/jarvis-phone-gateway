@@ -24,7 +24,7 @@ SESSION = {
     "goal": "Book a table",
     "details": "Party of 4.",
     "household_id": "hh-1",
-    "dialed_number": "+19082781811",
+    "dialed_number": "+15555550123",
     "record_enabled": True,
     "max_call_seconds": 600,
 }
@@ -198,7 +198,7 @@ class TestHappyPath:
         # Dialed the session's number with a bound TwiML.
         assert len(provider.dials) == 1
         number, twiml = provider.dials[0]
-        assert number == "+19082781811"
+        assert number == "+15555550123"
         assert "wss://calls.example.com/media/" in twiml
         assert "sess-1" in twiml
 

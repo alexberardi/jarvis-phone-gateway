@@ -21,7 +21,7 @@ class TestLookup:
 
         async with _client(handler) as http:
             result = await lookup_line_type(
-                "+19082781811", account_sid="AC1", auth_token="tok", http=http
+                "+15555550123", account_sid="AC1", auth_token="tok", http=http
             )
         assert result == "mobile"
 
