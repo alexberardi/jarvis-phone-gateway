@@ -40,6 +40,7 @@ from services.prompt import (
     EMPTY_REPLY_LINE,
     ESCALATION_FALLBACK_LINE,
     FALLBACK_GOODBYE_LINE,
+    GUARD_SUPPRESSED_LINE,
     HOLD_LINE,
     TURN_FAILURE_LINE,
     initial_messages,
@@ -47,6 +48,13 @@ from services.prompt import (
     with_no_think,
 )
 from services.session_client import SessionClient
+from services.spoken_guard import (
+    GuardSuppressed,
+    RestrictedField,
+    SpokenOutputGuard,
+    find_restricted,
+    parse_restricted,
+)
 from services.tts_guard import PcmChunkAdapter, validate_tts_response_headers
 
 logger = logging.getLogger(__name__)
@@ -176,11 +184,18 @@ class LiveTurnPipeline:
         # summary and dies with this object.
         self.redact_transcript = redact_transcript
         self._bg_tasks: set[asyncio.Task] = set()
+        # Give-if-asked details, structured, straight off the snapshot. Empty
+        # for a call with no stored context — then the guard costs nothing
+        # and never runs.
+        self.restricted: list[RestrictedField] = parse_restricted(
+            session.get("restricted_details")
+        )
+        self.guard = SpokenOutputGuard(llm)
 
     # ------------------------------------------------------------ generation
 
     async def _generate_reply(
-        self, media_session: Any
+        self, media_session: Any, heard: str
     ) -> tuple[np.ndarray, str, list[Any], float | None, float | None]:
         """One LLM stream → (pcm, spoken_text, events, llm_ttft_ms, tts_ttfb_ms)."""
         stripper = ThinkStripper()
@@ -209,13 +224,55 @@ class LiveTurnPipeline:
             if tail:
                 yield tail
 
+        # Sentences are collected, then filtered, then concatenated. Nothing
+        # reaches Twilio mid-turn anyway (the caller sends one PCM buffer for
+        # the whole reply), so a suppressed sentence leaves no audible seam.
+        #
+        # A sentence carrying a restricted value is NOT synthesized here — its
+        # synthesis waits until the verdict clears it. Synthesizing first and
+        # discarding after would work acoustically but would still hand the
+        # secret to jarvis-tts, and its logs, to produce audio nobody hears.
+        candidates: list[tuple[str, np.ndarray | None, list[RestrictedField]]] = []
+        verdict: asyncio.Task[set[str]] | None = None
+
         async for sentence in sentences(speakable_deltas()):
+            flagged = find_restricted(sentence, self.restricted)
+            if flagged:
+                if verdict is None:
+                    # Fired lazily and exactly once per turn: a turn that
+                    # discloses nothing pays nothing. Started rather than
+                    # awaited here so the classifier overlaps the rest of
+                    # generation instead of stalling it.
+                    verdict = asyncio.create_task(
+                        self.guard.asked_keys(heard, self.restricted, http=self.http)
+                    )
+                candidates.append((sentence, None, flagged))
+                continue
             pcm, ttfb = await self._speak_sentence(sentence)
             if ttfb is not None and tts_ttfb_ms is None:
                 tts_ttfb_ms = ttfb
             if len(pcm):
-                spoken_parts.append(sentence)
-                pcm_parts.append(pcm)
+                candidates.append((sentence, pcm, []))
+
+        asked = await verdict if verdict is not None else set()
+        for sentence, pcm, flagged in candidates:
+            if flagged:
+                if not all(f.key in asked for f in flagged):
+                    logger.warning(
+                        "Guard suppressed a sentence on %s — it would have "
+                        "disclosed %s without being asked",
+                        self.session_id,
+                        ", ".join(f.label for f in flagged),
+                    )
+                    events.append(GuardSuppressed([f.label for f in flagged]))
+                    continue
+                pcm, ttfb = await self._speak_sentence(sentence)
+                if ttfb is not None and tts_ttfb_ms is None:
+                    tts_ttfb_ms = ttfb
+            if pcm is None or not len(pcm):
+                continue
+            spoken_parts.append(sentence)
+            pcm_parts.append(pcm)
 
         reply_pcm = np.concatenate(pcm_parts) if pcm_parts else _EMPTY
         return reply_pcm, " ".join(spoken_parts), events, llm_ttft_ms, tts_ttfb_ms
@@ -244,7 +301,7 @@ class LiveTurnPipeline:
 
         try:
             pcm, said, events, llm_ttft_ms, tts_ttfb_ms = await self._generate_reply(
-                media_session
+                media_session, heard
             )
         except (TurnTimeout, LlmStreamError) as e:
             # Spoken fallback, bounded dead air — never silence into the void.
@@ -277,6 +334,8 @@ class LiveTurnPipeline:
             elif isinstance(ev, Dtmf):
                 logger.info("[DTMF] parsed but ignored until P2: %r", ev.digits)
                 event_names.append("dtmf_ignored")
+            elif isinstance(ev, GuardSuppressed):
+                event_names.append("guard_suppressed")
 
         if escalate_q is not None and not hangup:
             extra_pcm, extra_said = await self._run_escalation(
@@ -328,7 +387,15 @@ class LiveTurnPipeline:
             if they_closed and not hangup:
                 hangup = True
                 event_names.append("closed_by_callee")
-            recovery = FALLBACK_GOODBYE_LINE if hangup else EMPTY_REPLY_LINE
+            if hangup:
+                recovery = FALLBACK_GOODBYE_LINE
+            elif "guard_suppressed" in event_names:
+                # The reply was not empty — it was withheld. Saying "could you
+                # repeat that?" here would invite the same question and the
+                # same suppression, forever.
+                recovery = GUARD_SUPPRESSED_LINE
+            else:
+                recovery = EMPTY_REPLY_LINE
             logger.warning(
                 "Empty reply on turn %d for %s — speaking fallback %r",
                 turn_no, self.session_id, recovery,
@@ -389,7 +456,13 @@ class LiveTurnPipeline:
                 f"answered your question: {answer}]",
             }
         )
-        pcm, said, events, _, _ = await self._generate_reply(media_session)
+        # The guard's ask-context here is the question that CAUSED the
+        # escalation — that is what the callee asked for. Note this is the
+        # model's own wording, but it is not an unchecked bypass: an escalation
+        # is displayed on the user's phone and waits for them to answer it, so
+        # anything unlocked this way was released by a human who saw the
+        # question, which is a stronger authorization than the classifier.
+        pcm, said, events, _, _ = await self._generate_reply(media_session, question)
         if said:
             self.messages.append({"role": "assistant", "content": said})
         for ev in events:
