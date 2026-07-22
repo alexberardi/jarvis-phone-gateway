@@ -50,6 +50,26 @@ class SessionClient:
         r.raise_for_status()
         return r.json()
 
+    async def check_time(
+        self, session_id: str, utterance: str, *, http: httpx.AsyncClient
+    ) -> dict:
+        """Ask CC whether a time the callee proposed is available.
+
+        CC owns the interval arithmetic (it also owns the envelope format), so
+        the gateway never parses times itself. Returns the raw verdict
+        ({time_detected, available, proposed_label, acceptable_summary});
+        raising is fine here — the caller treats any failure as "no verdict"
+        and lets the model carry the turn, so this never blocks a call.
+        """
+        r = await http.post(
+            f"{self.base_url}/internal/phone/sessions/{session_id}/check-time",
+            json={"utterance": utterance},
+            headers=self._headers,
+            timeout=3.0,
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def _post_event(
         self,
         session_id: str,
