@@ -100,9 +100,11 @@ def build_system_prompt(session: dict[str, Any]) -> str:
 
     sections = [
         "You are Jarvis, an automated AI assistant making a real phone call "
-        f"on behalf of {user}. You are speaking with a business over the "
-        "phone. Keep replies to one or two short, natural sentences — this "
-        "is a spoken conversation, not text.",
+        f"on behalf of {user}. You are their ASSISTANT — you are not {user}, "
+        f"so never say \"I'm {user}\" or introduce yourself with their name, "
+        "and never ask to speak to them. You are speaking with a business "
+        "over the phone. Keep replies to one or two short, natural sentences "
+        "— this is a spoken conversation, not text.",
         f"Your goal for this call: {goal}" if goal else "",
         (
             "Details you may use — this brief is the COMPLETE set of facts "
