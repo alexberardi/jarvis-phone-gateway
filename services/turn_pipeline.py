@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -60,6 +61,20 @@ from services.tts_guard import PcmChunkAdapter, validate_tts_response_headers
 logger = logging.getLogger(__name__)
 
 _EMPTY = np.array([], dtype=np.int16)
+
+# A loose gate so a non-scheduling turn never makes a CC call: a weekday, a
+# clock-ish number, or noon/midnight. Deliberately over-inclusive — CC returns
+# time_detected=False for a false positive, so the cost of one is a cheap
+# round-trip, not a wrong answer.
+_TIME_HINT_RE = re.compile(
+    r"\b(mon|tue|wed|thu|fri|sat|sun|noon|midnight|\d{1,2}\s*(?:o'?clock|am|pm|a\.m|p\.m)|"
+    r"at\s+\d{1,2})",
+    re.IGNORECASE,
+)
+
+
+def _might_propose_time(text: str) -> bool:
+    return bool(_TIME_HINT_RE.search(text or ""))
 
 
 async def transcribe(
@@ -195,9 +210,15 @@ class LiveTurnPipeline:
     # ------------------------------------------------------------ generation
 
     async def _generate_reply(
-        self, media_session: Any, heard: str
+        self, media_session: Any, heard: str, scheduling_note: str | None = None
     ) -> tuple[np.ndarray, str, list[Any], float | None, float | None]:
-        """One LLM stream → (pcm, spoken_text, events, llm_ttft_ms, tts_ttfb_ms)."""
+        """One LLM stream → (pcm, spoken_text, events, llm_ttft_ms, tts_ttfb_ms).
+
+        ``scheduling_note`` is an ephemeral system message injected for THIS
+        generation only (not persisted into the conversation) — the
+        deterministic availability verdict, so the model states it instead of
+        doing interval math it gets wrong.
+        """
         stripper = ThinkStripper()
         parser = ToolTokenParser()
         events: list[Any] = []
@@ -207,10 +228,19 @@ class LiveTurnPipeline:
         spoken_parts: list[str] = []
         pcm_parts: list[np.ndarray] = []
 
+        # Injected transiently — the note guides this reply but must not linger
+        # in history (a later turn's "Thursday at noon is available" would be
+        # stale, and it would also shift the cached prompt prefix every turn).
+        gen_messages = self.messages
+        if scheduling_note:
+            gen_messages = self.messages + [
+                {"role": "system", "content": scheduling_note}
+            ]
+
         async def speakable_deltas():
             nonlocal llm_ttft_ms
             async for delta in self.llm.stream_deltas(
-                self.messages, http=self.http, turn_timeout_s=self.turn_timeout_s
+                gen_messages, http=self.http, turn_timeout_s=self.turn_timeout_s
             ):
                 if llm_ttft_ms is None:
                     llm_ttft_ms = (time.monotonic() - t0) * 1000
@@ -284,6 +314,55 @@ class LiveTurnPipeline:
             logger.error("TTS failed for sentence %r: %s", sentence[:60], e)
             return _EMPTY, None
 
+    # ---------------------------------------------------------- scheduling
+
+    async def _scheduling_note(self, heard: str) -> str | None:
+        """A deterministic availability verdict for a time the callee proposed.
+
+        Only for scheduling calls (those carry a constraint envelope), and only
+        when the utterance looks like it names a time — so a normal turn makes
+        no CC call. CC does the parsing and the interval check (it owns the
+        envelope format); the gateway only phrases the verdict for the model.
+
+        Fails OPEN: any error, or no time detected, returns None and the model
+        carries the turn exactly as before. This must never stall or drop a
+        call — it is the first per-turn CC dependency, so it is best-effort.
+        """
+        if not self.session.get("constraints"):
+            return None
+        if self.session_client is None or not _might_propose_time(heard):
+            return None
+        try:
+            v = await self.session_client.check_time(
+                self.session_id, heard, http=self.http
+            )
+        except Exception as e:  # noqa: BLE001 — never block a turn on the check
+            logger.warning("time check unavailable for %s: %s", self.session_id, e)
+            return None
+
+        if not v.get("time_detected") or v.get("available") is None:
+            return None
+        # "Ground truth, do not recompute" framing: the model does its own
+        # (wrong) interval math against the times it can see and will argue
+        # with a plain verdict — this states it as settled fact. Reliably
+        # stops the model AGREEING to an out-of-window time (the harmful bug);
+        # the model can still stubbornly decline a valid wide-window slot, but
+        # that fails safe. See tests + the real-model notes on this call.
+        label = v.get("proposed_label") or "that time"
+        if v.get("available"):
+            return (
+                f"[Scheduling check — ground truth, do not recompute: {label} "
+                "is confirmed OPEN on the caller's calendar. Treat it as "
+                "available: offer that slot to the business, and do not tell "
+                "them it is unavailable.]"
+            )
+        summary = v.get("acceptable_summary") or "the times in your brief"
+        return (
+            f"[Scheduling check — ground truth, do not recompute: {label} is "
+            "NOT open on the caller's calendar. Do not agree to it. Offer a "
+            f"time from — {summary}]"
+        )
+
     # ------------------------------------------------------------ the turn
 
     async def __call__(
@@ -299,9 +378,13 @@ class LiveTurnPipeline:
         # Directive re-asserted per turn; the transcript records `heard` raw.
         self.messages.append({"role": "user", "content": with_no_think(heard)})
 
+        # Deterministic scheduling verdict (best-effort; None on a non-time
+        # turn or any failure), injected only into this generation.
+        scheduling_note = await self._scheduling_note(heard)
+
         try:
             pcm, said, events, llm_ttft_ms, tts_ttfb_ms = await self._generate_reply(
-                media_session, heard
+                media_session, heard, scheduling_note
             )
         except (TurnTimeout, LlmStreamError) as e:
             # Spoken fallback, bounded dead air — never silence into the void.

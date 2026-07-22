@@ -61,14 +61,23 @@ class FakeLlm:
 
 
 class FakeSessionClient:
-    def __init__(self):
+    def __init__(self, time_verdict=None, check_error=None):
         self.events: list[tuple] = []
+        self.time_verdict = time_verdict
+        self.check_error = check_error
+        self.checked: list[str] = []
 
     async def turn_event(self, session_id, turn, *, http):
         self.events.append(("turn", turn))
 
     async def escalation_event(self, session_id, question, *, http):
         self.events.append(("escalation", question))
+
+    async def check_time(self, session_id, utterance, *, http):
+        self.checked.append(utterance)
+        if self.check_error:
+            raise self.check_error
+        return self.time_verdict or {"time_detected": False, "available": None}
 
 
 class FakeMediaSession:
@@ -573,3 +582,126 @@ class TestSpokenOutputGuard:
         await drain(pipe)
 
         assert len(llm.completions) == 1
+
+
+class TestSchedulingCheck:
+    """Deterministic availability verdict injected per turn.
+
+    The model can't do interval math under /no_think (it false-declines valid
+    times and false-accepts invalid ones); CC does the check and the gateway
+    states the verdict. These prove the verdict reaches the model, only on
+    scheduling turns, and never blocks a call.
+    """
+
+    SCHED = {**SESSION, "constraints": "Acceptable times: Thu 9am-8pm"}
+
+    def _pipeline(self, llm, cc):
+        return LiveTurnPipeline(
+            session=self.SCHED,
+            whisper_url="http://w",
+            tts_url="http://t",
+            llm=llm,
+            http=None,
+            session_client=cc,
+        )
+
+    def _note_in_last_call(self, llm):
+        # FakeLlm.stream_deltas records each message list it was given.
+        msgs = llm.calls[-1]
+        return next(
+            (m["content"] for m in msgs if "Scheduling check" in m.get("content", "")),
+            None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_available_verdict_reaches_the_model(self, stub_services):
+        llm = FakeLlm([["Yes, Thursday at noon works."]])
+        cc = FakeSessionClient(time_verdict={
+            "time_detected": True, "available": True,
+            "proposed_label": "Thursday at noon", "acceptable_summary": None,
+        })
+        pipe = self._pipeline(llm, cc)
+        stub_services["transcripts"] = "Can you do Thursday at noon?"
+
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert cc.checked == ["Can you do Thursday at noon?"]
+        note = self._note_in_last_call(llm)
+        assert note and "confirmed OPEN" in note and "Thursday at noon" in note
+
+    @pytest.mark.asyncio
+    async def test_unavailable_verdict_tells_the_model_to_decline(self, stub_services):
+        llm = FakeLlm([["That time isn't available."]])
+        cc = FakeSessionClient(time_verdict={
+            "time_detected": True, "available": False,
+            "proposed_label": "Wednesday at 12",
+            "acceptable_summary": "Acceptable times: Thu 9am-8pm",
+        })
+        pipe = self._pipeline(llm, cc)
+        stub_services["transcripts"] = "How about Wednesday at 12?"
+
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        note = self._note_in_last_call(llm)
+        assert note and "NOT open" in note and "Thu 9am-8pm" in note
+
+    @pytest.mark.asyncio
+    async def test_the_note_does_not_persist_into_history(self, stub_services):
+        """A verdict is guidance for THIS turn only — leaving it in history
+        would give a later turn a stale answer and shift the cached prefix."""
+        llm = FakeLlm([["Yes, that works."], ["Sure."]])
+        cc = FakeSessionClient(time_verdict={
+            "time_detected": True, "available": True,
+            "proposed_label": "Thursday at noon", "acceptable_summary": None,
+        })
+        pipe = self._pipeline(llm, cc)
+        stub_services["transcripts"] = "Thursday at noon?"
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert not any("Scheduling check" in m.get("content", "") for m in pipe.messages)
+
+    @pytest.mark.asyncio
+    async def test_no_time_turn_makes_no_check(self, stub_services):
+        llm = FakeLlm([["Sure."]])
+        cc = FakeSessionClient()
+        pipe = self._pipeline(llm, cc)
+        stub_services["transcripts"] = "What's the address?"  # no day/time
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert cc.checked == []  # gated out before any CC call
+
+    @pytest.mark.asyncio
+    async def test_non_scheduling_call_never_checks(self, stub_services):
+        """A pizza order has no constraint envelope — the check is skipped
+        even if the utterance mentions a number."""
+        llm = FakeLlm([["Sure."]])
+        cc = FakeSessionClient()
+        pipe = LiveTurnPipeline(
+            session=SESSION,  # no "constraints"
+            whisper_url="http://w", tts_url="http://t", llm=llm, http=None,
+            session_client=cc,
+        )
+        stub_services["transcripts"] = "I'll have 2 pizzas at 6."
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert cc.checked == []
+
+    @pytest.mark.asyncio
+    async def test_check_failure_fails_open(self, stub_services):
+        """CC down must not stall or drop the turn — the model just carries it
+        unaided, exactly as before this feature."""
+        llm = FakeLlm([["Let me see."]])
+        cc = FakeSessionClient(check_error=RuntimeError("CC down"))
+        pipe = self._pipeline(llm, cc)
+        stub_services["transcripts"] = "Thursday at noon?"
+
+        pcm = await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert pcm is not None  # turn completed
+        assert self._note_in_last_call(llm) is None  # no verdict injected
