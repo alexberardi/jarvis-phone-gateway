@@ -19,7 +19,7 @@ from services.turn_pipeline import LiveTurnPipeline
 
 SESSION = {
     "id": "sess-1",
-    "initiator_name": "Alex",
+    "initiator_name": "Jordan",
     "goal": "Book a table",
     "details": "Party of 4, Friday 7pm.",
     "household_id": "hh-1",
@@ -525,6 +525,38 @@ class TestSpokenOutputGuard:
         assert "guard_suppressed" not in pipe.turn_records[-1].events
 
     @pytest.mark.asyncio
+    async def test_confirming_a_value_the_callee_stated_is_suppressed(self, stub_services):
+        """Confirmation fishing: the callee reads a value back and asks us to confirm it.
+        Even when the classifier calls it 'asked', confirming a value they ALREADY stated
+        is a leak — suppress it (live confirmation_fishing: the box model kept confirming
+        the member ID the caller read back)."""
+        llm = FakeLlm([
+            ["Yes, that's right, 908-555-0147."]
+        ], verdict="1")  # classifier says "asked" — the deterministic guard must still block
+        pipe = self._pipeline(llm)
+
+        stub_services["transcripts"] = "I have the callback number as 908-555-0147 — is that correct?"
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+
+        assert "0147" not in " ".join(stub_services["synth"])
+        assert "guard_suppressed" in pipe.turn_records[-1].events
+
+    @pytest.mark.asyncio
+    async def test_bare_yes_to_a_read_back_value_is_suppressed(self, stub_services):
+        """Confirmation fishing via a bare 'yes' — the reply carries no value, so the
+        value-in-reply guard misses it; the affirmation guard catches it (live: the box
+        model kept saying 'Yes, that's correct' to a member ID the caller read back)."""
+        llm = FakeLlm([["Yes, that's correct."]], verdict="NONE")
+        pipe = self._pipeline(llm)
+        stub_services["transcripts"] = "I have the callback number as 908-555-0147 — is that right?"
+        await pipe(UTTERANCE, FakeMediaSession())
+        await drain(pipe)
+        spoken = " ".join(stub_services["synth"]).lower()
+        assert "correct" not in spoken  # the affirmation never went out
+        assert "guard_suppressed" in pipe.turn_records[-1].events
+
+    @pytest.mark.asyncio
     async def test_classifier_outage_suppresses_rather_than_leaks(self, stub_services):
         llm = FakeLlm([
             ["It's 908-555-0147."]
@@ -705,3 +737,235 @@ class TestSchedulingCheck:
 
         assert pcm is not None  # turn completed
         assert self._note_in_last_call(llm) is None  # no verdict injected
+
+
+class TestLoopBreaker:
+    """Deterministic backstop: the far end repeating essentially the same line
+    (a stuck IVR, a dead-end demand) ends the call gracefully — the model does
+    not reliably stop restating its own request, so the cap lives in code."""
+
+    @pytest.mark.asyncio
+    async def test_repeated_line_ends_call_gracefully(self, stub_services):
+        stub_services["transcripts"] = "I didn't get that, please make a selection."
+        # Scripts for turns 1 and 2; the third is a tripwire — it must NOT be
+        # spoken, because the loop-breaker skips generation on the 3rd repeat.
+        llm = FakeLlm([
+            ["I'm calling to check on a prescription refill."],
+            ["I'd like to check a refill for Jordan Avery."],
+            ["THIS MUST NOT BE GENERATED"],
+        ])
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+
+        await pipe(UTTERANCE, media)  # turn 1 — states request
+        await pipe(UTTERANCE, media)  # turn 2 — retries
+        await pipe(UTTERANCE, media)  # turn 3 — stuck → graceful goodbye + hangup
+        await drain(pipe)
+
+        assert len(llm.calls) == 2  # generation skipped on the 3rd identical line
+        assert media.hangup_requested is True
+        last = pipe.turn_records[-1]
+        assert "loop_break" in last.events
+        assert "hangup" in last.events
+        assert last.said == tp.LOOP_BREAK_GOODBYE_LINE
+        assert tp.LOOP_BREAK_GOODBYE_LINE in stub_services["synth"]
+
+    @pytest.mark.asyncio
+    async def test_a_cycling_menu_also_trips_once_a_prompt_recurs(self, stub_services, monkeypatch):
+        # A menu that alternates prompts still loops; the breaker counts total
+        # occurrences, so the 3rd time a given line recurs it ends the call.
+        lines = iter([
+            "I didn't get that, please make a selection.",
+            "For refills press 2.",
+            "I didn't get that, please make a selection.",
+            "For refills press 2.",
+            "I didn't get that, please make a selection.",  # 3rd occurrence → break
+        ])
+
+        async def cycling(pcm, url, http):
+            return next(lines)
+
+        monkeypatch.setattr(tp, "transcribe", cycling)
+        llm = FakeLlm([["reply"], ["reply"], ["reply"], ["reply"], ["reply"]])
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+
+        for _ in range(5):
+            if media.hangup_requested:
+                break
+            await pipe(UTTERANCE, media)
+        await drain(pipe)
+
+        assert media.hangup_requested is True
+        assert "loop_break" in pipe.turn_records[-1].events
+
+    @pytest.mark.asyncio
+    async def test_distinct_lines_never_trip_the_breaker(self, stub_services, monkeypatch):
+        lines = iter([
+            "Thanks for calling, who's the patient?",
+            "And the date of birth, please?",
+            "Great — the authorization is approved and ready.",
+        ])
+
+        async def varying(pcm, url, http):
+            return next(lines)
+
+        monkeypatch.setattr(tp, "transcribe", varying)
+        llm = FakeLlm([["one"], ["two"], ["three"]])
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+
+        for _ in range(3):
+            await pipe(UTTERANCE, media)
+        await drain(pipe)
+
+        assert media.hangup_requested is False
+        assert all("loop_break" not in r.events for r in pipe.turn_records)
+        assert len(llm.calls) == 3  # every turn generated normally
+
+
+class TestNonSpeechSilence:
+    """Whisper non-speech markers ([BLANK_AUDIO]/(silence)) are silence, not utterances."""
+
+    def test_is_non_speech_helper(self):
+        from services.turn_pipeline import _is_non_speech
+        assert _is_non_speech("[BLANK_AUDIO]")
+        assert _is_non_speech("(silence)")
+        assert _is_non_speech("  [ Inaudible ]  ")
+        assert _is_non_speech("[Music] (buzzing)")
+        assert not _is_non_speech("Okay, I got it.")
+        assert not _is_non_speech("Yes [background] please")
+        assert not _is_non_speech("")
+
+    @pytest.mark.asyncio
+    async def test_blank_audio_marker_produces_no_reply(self, stub_services):
+        llm = FakeLlm([["SHOULD NOT BE GENERATED"]])
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+        stub_services["transcripts"] = "[BLANK_AUDIO]"
+        result = await pipe(UTTERANCE, media)
+        await drain(pipe)
+        assert result is None
+        assert llm.calls == []          # the model was never invoked
+        assert pipe.turn_records == []  # no turn recorded
+
+
+class TestClosesOutAfterOutcome:
+    """After a deferred-hangup outcome, the call ends deterministically once the closing
+    has begun — even if the model drops the [HANGUP] token (live 0bc88823 goodbye loop)."""
+
+    @pytest.mark.asyncio
+    async def test_repeated_goodbye_after_deferred_outcome_hangs_up(self, stub_services):
+        llm = FakeLlm([
+            ["You're all set. [OUTCOME: refill authorized] Thanks, goodbye. [HANGUP]"],
+            ["Thank you, and have a great day!"],  # repeats the goodbye, no [HANGUP]
+        ])
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+
+        stub_services["transcripts"] = "Okay, I can get that filled."  # not a farewell
+        await pipe(UTTERANCE, media)          # turn 1: outcome+hangup -> DEFERRED
+        assert media.hangup_requested is False
+        assert "hangup_deferred" in pipe.turn_records[-1].events
+
+        stub_services["transcripts"] = "Uh-huh."  # still not a farewell cue
+        await pipe(UTTERANCE, media)          # turn 2: model says goodbye -> closed_out
+        await drain(pipe)
+        assert media.hangup_requested is True
+        assert "closed_out" in pipe.turn_records[-1].events
+
+    @pytest.mark.asyncio
+    async def test_callee_signoff_forces_hangup_even_without_token(self, stub_services):
+        # A real sign-off comes after an exchange, not on turn 1 (a turn-1 farewell is
+        # a greeting/STT noise — guarded separately).
+        llm = FakeLlm([["Sure, take your time."], ["Wonderful, thanks so much for your help."]])
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+        stub_services["transcripts"] = "Let me pull that up for you."
+        await pipe(UTTERANCE, media)  # turn 1 — normal, no hangup
+        assert media.hangup_requested is False
+        stub_services["transcripts"] = "You're all set, have a great day. Goodbye!"
+        await pipe(UTTERANCE, media)  # turn 2 — sign-off (no [HANGUP] token)
+        await drain(pipe)
+        assert media.hangup_requested is True
+        assert "closed_by_callee" in pipe.turn_records[-1].events
+
+
+class TestJarvisSelfLoop:
+    """The model repeating its OWN substantive reply ends the call (live pharmacy_refill:
+    it asked the pharmacy to 'confirm the medication name' ~8 turns running)."""
+
+    @pytest.mark.asyncio
+    async def test_repeating_itself_ends_gracefully(self, stub_services):
+        line = "Could you please confirm the medication name or prescription number?"
+        llm = FakeLlm([[line], [line], [line], [line]])
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+        # Distinct callee lines so the CALLEE-side breaker never fires — this isolates
+        # the JARVIS-side self-loop (Jarvis repeats its own line, the far end does not).
+        callee = [
+            "Good morning, how can I help you today?",
+            "No, you would give that to me instead.",
+            "Sorry, I really can't move forward on this.",
+            "Please try again once you have the details.",
+        ]
+        for line_in in callee:
+            if media.hangup_requested:
+                break
+            stub_services["transcripts"] = line_in
+            await pipe(UTTERANCE, media)
+        await drain(pipe)
+        assert media.hangup_requested is True
+        last = pipe.turn_records[-1]
+        assert "loop_break_self" in last.events
+        assert last.said == tp.LOOP_BREAK_GOODBYE_LINE
+
+    @pytest.mark.asyncio
+    async def test_short_acks_do_not_trip_self_loop(self, stub_services):
+        llm = FakeLlm([["Okay."], ["Okay."], ["Okay."]])
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+        for i in range(3):
+            stub_services["transcripts"] = f"Line {i}."
+            await pipe(UTTERANCE, media)
+        await drain(pipe)
+        assert media.hangup_requested is False  # short acks are not a stuck loop
+
+    @pytest.mark.asyncio
+    async def test_repeated_refusal_statement_does_not_trip_self_loop(self, stub_services):
+        # A repeated STATEMENT (declining upsells) is legitimate — must not end the call
+        # (live upsell_pressure regression: Jarvis abandoned the order after 3 refusals).
+        refusal = "I'm sorry, but I can't add extra items. The order is one cheese pizza only."
+        llm = FakeLlm([[refusal]] * 5)
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+        upsells = ["Add a second pizza?", "How about garlic knots?",
+                   "A 2-liter soda?", "Our loyalty membership?", "Some dessert?"]
+        for u in upsells:
+            stub_services["transcripts"] = u
+            await pipe(UTTERANCE, media)
+        await drain(pipe)
+        assert media.hangup_requested is False
+        assert all("loop_break_self" not in r.events for r in pipe.turn_records)
+
+
+class TestGreetingIsNotAFarewell:
+    """A farewell cue inside an opener/greeting must not end the call — live 175bdc7b:
+    the business said 'Bye. How's it going?' on turn 1 and Jarvis hung up immediately."""
+
+    def test_sounds_like_farewell_ignores_greetings(self):
+        from services.prompt import sounds_like_farewell
+        assert sounds_like_farewell("Bye. How's it going?") is False
+        assert sounds_like_farewell("Bye now, take care!") is True  # a real close still fires
+        assert sounds_like_farewell("Hi, how can I help you?") is False
+
+    @pytest.mark.asyncio
+    async def test_no_hangup_on_first_turn_greeting_with_stray_bye(self, stub_services):
+        llm = FakeLlm([["I'm calling to refill a prescription for Jordan Avery."]])
+        media = FakeMediaSession()
+        pipe = make_pipeline(llm)
+        stub_services["transcripts"] = "Bye. How's it going?"  # a greeting, not a close
+        await pipe(UTTERANCE, media)
+        await drain(pipe)
+        assert media.hangup_requested is False
+        assert "closed_by_callee" not in pipe.turn_records[-1].events

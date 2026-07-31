@@ -27,7 +27,7 @@ from tests.test_media_ws import LOUD, QUIET, TEST_VAD, media_msg, start_msg
 
 SESSION = {
     "id": "sess-live",
-    "initiator_name": "Alex",
+    "initiator_name": "Jordan",
     "goal": "Book a table",
     "details": "Party of 4, Friday 7pm.",
     "household_id": "hh-1",

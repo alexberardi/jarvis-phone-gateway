@@ -24,7 +24,9 @@ with this object.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -52,10 +54,39 @@ DEFAULT_MAX_CALL_SECONDS = 600
 _HANGUP_GRACE_S = 10.0
 
 _SUMMARY_INSTRUCTION = (
-    "Summarize this phone call in two sentences for the person it was made "
-    "on behalf of. State plainly whether the goal was achieved. Do not "
-    "invent details. /no_think"
+    "You just listened to a phone call an assistant made ON BEHALF OF someone. "
+    "Return ONLY a JSON object: "
+    '{"summary": "<two plain sentences for the person it was made for: what happened '
+    'and whether the goal was achieved>", "goal_achieved": true|false}. '
+    "Judge success ONLY by what the BUSINESS (the other party) actually said — NOT by "
+    "what the assistant claimed or said it would do. The assistant saying 'I'll "
+    "proceed', 'I've booked it', or 'that's all set' is NOT success; only the BUSINESS "
+    "confirming the booking / order / authorization / answer counts. "
+    "goal_achieved is true ONLY if the business EXPLICITLY confirmed the goal was "
+    "done. It is FALSE if the goal was refused, left incomplete, uncertain, or if the "
+    "business still needed information the assistant did not give (for example: the "
+    "assistant said 'I'll proceed with the refill' but the business said it still "
+    "needed the prescription — that is goal_achieved=false). When in doubt, false. "
+    "Do not invent details. /no_think"
 )
+
+
+def _parse_assessment(content: str) -> tuple[str, bool | None]:
+    """Extract (summary, goal_achieved) from the wrapup model's JSON reply. Tolerant
+    of code fences and surrounding prose; falls back to (the raw text as the summary,
+    None) when no usable JSON / boolean verdict is found."""
+    text = (content or "").strip()
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            summary = str(data.get("summary") or "").strip()
+            ga = data.get("goal_achieved")
+            return (summary or text), (ga if isinstance(ga, bool) else None)
+    return text, None
 
 
 @dataclass
@@ -310,7 +341,7 @@ class DialWorker:
         await self._state_quietly(session_id, "wrapup", http)
         pipeline = runtime.pipeline
 
-        summary = await self._summarize(pipeline, http)
+        summary, goal_achieved = await self._assess(pipeline, http)
 
         audio_key: str | None = None
         if runtime.recorder is not None:
@@ -322,6 +353,9 @@ class DialWorker:
 
         outcome = {
             "summary": summary,
+            # STRUCTURED success verdict — downstream (the errand engine's fail-fast)
+            # keys on this, not on the prose summary. Absent/None means unconfirmed.
+            "goal_achieved": goal_achieved,
             "facts": pipeline.outcome_facts,
             "turns": len(pipeline.turn_records),
             "escalation_unanswered": pipeline.escalation_unanswered,
@@ -336,13 +370,16 @@ class DialWorker:
         except Exception as e:  # noqa: BLE001 — last resort: log loudly
             logger.error("Outcome/done report failed for %s: %s", session_id, e)
 
-    async def _summarize(
+    async def _assess(
         self, pipeline: LiveTurnPipeline, http: httpx.AsyncClient
-    ) -> str:
-        """Post-call summary on the background model; honest fallback."""
+    ) -> tuple[str, bool | None]:
+        """Post-call assessment on the background model → (summary, goal_achieved).
+        goal_achieved is the STRUCTURED success verdict downstream keys on; None when
+        the model is unavailable or its verdict can't be parsed (→ conservative
+        fail-fast). Honest fallback summary."""
         transcript = pipeline.transcript()
         if not transcript:
-            return "The call ended before any conversation took place."
+            return "The call ended before any conversation took place.", False
         messages = transcript + [{"role": "user", "content": _SUMMARY_INSTRUCTION}]
         try:
             r = await http.post(
@@ -355,18 +392,19 @@ class DialWorker:
                 timeout=60.0,
             )
             r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
             # The background model may be a thinking model — never let
             # chain-of-thought reach the outcome card.
-            return strip_think_text(str(content)) or "Call completed."
+            content = strip_think_text(str(r.json()["choices"][0]["message"]["content"]))
+            summary, goal_achieved = _parse_assessment(content)
+            return summary or "Call completed.", goal_achieved
         except Exception as e:  # noqa: BLE001
-            logger.error("Wrapup summary failed: %s", e)
+            logger.error("Wrapup assessment failed: %s", e)
             facts = "; ".join(pipeline.outcome_facts)
             return (
                 f"Call completed. Recorded facts: {facts}"
                 if facts
                 else "Call completed (summary unavailable)."
-            )
+            ), None  # unparsed → unconfirmed (fail-fast downstream)
 
     # ------------------------------------------------------------ helpers
 
