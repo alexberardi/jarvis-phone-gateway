@@ -20,7 +20,7 @@ from telephony.twilio_provider import SessionTokenRegistry
 
 SESSION = {
     "id": "sess-1",
-    "initiator_name": "Alex",
+    "initiator_name": "Jordan",
     "goal": "Book a table",
     "details": "Party of 4.",
     "household_id": "hh-1",
@@ -114,12 +114,12 @@ def voice_stubs(monkeypatch):
     async def fake_upload(household_id, session_id, wav):
         return f"{household_id}/{session_id}.wav"
 
-    async def fake_summary(self, pipeline, http):
-        return "Booked Friday 7pm."
+    async def fake_assess(self, pipeline, http):
+        return "Booked Friday 7pm.", True
 
     monkeypatch.setattr(dw, "synthesize", fake_synthesize)
     monkeypatch.setattr(dw, "upload_recording", fake_upload)
-    monkeypatch.setattr(DialWorker, "_summarize", fake_summary)
+    monkeypatch.setattr(DialWorker, "_assess", fake_assess)
     monkeypatch.setattr(dw, "STREAM_START_TIMEOUT_S", 0.5)
     monkeypatch.setattr(dw, "HEARTBEAT_INTERVAL_S", 0.05)
 
@@ -286,3 +286,19 @@ class TestSupervision:
         await worker.handle_job(DialJob("sess-1", "hh-1"))
         await finisher
         assert ("heartbeat",) in cc.events
+
+
+def test_parse_assessment_extracts_goal_achieved():
+    """The wrapup verdict feeds the errand engine's fail-fast — a robust parse of the
+    background model's {summary, goal_achieved} JSON (fence/prose tolerant; a bad
+    verdict degrades to None = unconfirmed)."""
+    from services.dial_worker import _parse_assessment
+
+    assert _parse_assessment('{"summary":"Authorization granted.","goal_achieved":true}') == (
+        "Authorization granted.", True)
+    assert _parse_assessment('```json\n{"summary":"Still pending.","goal_achieved":false}\n```') == (
+        "Still pending.", False)
+    # no usable JSON / no boolean → unconfirmed (conservative fail-fast downstream)
+    assert _parse_assessment("The line dropped before anything was confirmed.") == (
+        "The line dropped before anything was confirmed.", None)
+    assert _parse_assessment('{"summary":"x","goal_achieved":"yes"}') == ("x", None)

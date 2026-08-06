@@ -23,6 +23,7 @@ latency budget is only enforceable if the gateway emits what it measures).
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import re
 import time
@@ -43,17 +44,20 @@ from services.prompt import (
     FALLBACK_GOODBYE_LINE,
     GUARD_SUPPRESSED_LINE,
     HOLD_LINE,
+    LOOP_BREAK_GOODBYE_LINE,
     TURN_FAILURE_LINE,
     initial_messages,
     sounds_like_farewell,
     with_no_think,
 )
 from services.session_client import SessionClient
+from services.speech_format import format_for_speech
 from services.spoken_guard import (
     GuardSuppressed,
     RestrictedField,
     SpokenOutputGuard,
     find_restricted,
+    mentions,
     parse_restricted,
 )
 from services.tts_guard import PcmChunkAdapter, validate_tts_response_headers
@@ -75,6 +79,50 @@ _TIME_HINT_RE = re.compile(
 
 def _might_propose_time(text: str) -> bool:
     return bool(_TIME_HINT_RE.search(text or ""))
+
+
+# Deterministic loop-breaker. If the other end says essentially the same thing this
+# many turns in a row (an automated menu we cannot navigate, or any dead-end), the
+# pipeline ends the call gracefully. The model does not reliably stop restating its
+# own request — live it looped 8x on an IVR — so the cap is enforced in code, not by
+# the prompt. Threshold 3 = state your request, one retry, then a graceful close.
+_LOOP_REPEAT_LIMIT = 3
+_LOOP_SIMILARITY = 0.85
+
+
+def _normalize_line(s: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", (s or "").lower()).split())
+
+
+def _similar_line(a: str, b: str) -> bool:
+    na, nb = _normalize_line(a), _normalize_line(b)
+    if not na or not nb:
+        return False
+    return na == nb or difflib.SequenceMatcher(None, na, nb).ratio() >= _LOOP_SIMILARITY
+
+
+# Whisper emits bracketed/parenthesized markers for non-speech audio ('[BLANK_AUDIO]',
+# '(silence)', '[Music]', '[ Inaudible ]'). A turn whose transcript is ONLY such markers
+# is silence, not an utterance — feeding it to the model makes it reply into the void
+# (live 0bc88823: the callee went quiet, whisper returned [BLANK_AUDIO], and the model
+# repeated its goodbye instead of the call ending on the idle timer).
+_NON_SPEECH_RE = re.compile(r"^(?:[\s\W]*(?:\[[^\]]*\]|\([^)]*\))[\s\W]*)+$")
+
+
+def _is_non_speech(heard: str) -> bool:
+    s = (heard or "").strip()
+    return bool(s) and _NON_SPEECH_RE.fullmatch(s) is not None
+
+
+# A bare affirmation ('yes', 'that's correct'). When the caller has READ a private value
+# BACK to us and we answer with one of these, we've confirmed it — a leak the value-in-
+# reply guard misses because our reply carries no value (live confirmation_fishing: the
+# box model kept saying "Yes, that's correct" to a member ID the caller stated).
+_AFFIRM_RE = re.compile(
+    r"^\s*(yes|yeah|yep|yup|correct|right|that'?s (right|correct)|that is (right|correct)|"
+    r"confirmed|affirmative|exactly)\b",
+    re.IGNORECASE,
+)
 
 
 async def transcribe(
@@ -104,6 +152,10 @@ async def synthesize(
     text = text.strip()
     if not text:
         return _EMPTY, None
+    # Dictate IDs / phone numbers / spelled names char-by-char so the engine doesn't
+    # read them as cardinals or run the letters together (audio only — the transcript
+    # keeps the human-readable form).
+    text = format_for_speech(text)
     t0 = time.monotonic()
     async with http.stream(
         "POST",
@@ -264,8 +316,20 @@ class LiveTurnPipeline:
         # secret to jarvis-tts, and its logs, to produce audio nobody hears.
         candidates: list[tuple[str, np.ndarray | None, list[RestrictedField]]] = []
         verdict: asyncio.Task[set[str]] | None = None
+        # The caller has read one of our private values BACK to us this turn — any bare
+        # "yes/that's correct" now confirms it (a leak the value-in-reply guard misses).
+        fishing = bool(self.restricted) and any(
+            mentions(heard, f.value) for f in self.restricted
+        )
 
         async for sentence in sentences(speakable_deltas()):
+            if fishing and _AFFIRM_RE.match(sentence):
+                logger.warning(
+                    "Guard suppressed a bare confirmation on %s — the caller read a "
+                    "private value back and we were about to confirm it", self.session_id,
+                )
+                events.append(GuardSuppressed(["confirmation"]))
+                continue
             flagged = find_restricted(sentence, self.restricted)
             if flagged:
                 if verdict is None:
@@ -285,6 +349,14 @@ class LiveTurnPipeline:
                 candidates.append((sentence, pcm, []))
 
         asked = await verdict if verdict is not None else set()
+        # Confirmation-fishing guard (deterministic, independent of the classifier): if
+        # the callee already STATED a restricted value in their line ("is it ZQ-0001234?"),
+        # they are not legitimately asking us to provide it — they are fishing for a
+        # yes/no, and confirming it is a leak. Drop those fields from `asked` so the
+        # sentence is suppressed. Live confirmation_fishing: the box model kept confirming
+        # the member ID the caller read back.
+        if asked:
+            asked = asked - {f.key for f in self.restricted if mentions(heard, f.value)}
         for sentence, pcm, flagged in candidates:
             if flagged:
                 if not all(f.key in asked for f in flagged):
@@ -365,6 +437,52 @@ class LiveTurnPipeline:
 
     # ------------------------------------------------------------ the turn
 
+    def _stuck_in_loop(self, heard: str) -> bool:
+        """True once the far end has said essentially THIS line _LOOP_REPEAT_LIMIT
+        times (counting now) — a stuck IVR that repeats a prompt, or a menu that keeps
+        cycling back to it. Counts all prior turns, not just consecutive ones, so a
+        menu that alternates a few prompts still trips once one recurs enough. High
+        similarity threshold so ordinary back-and-forth never trips it."""
+        prior_repeats = sum(1 for r in self.turn_records if _similar_line(heard, r.heard))
+        return prior_repeats >= _LOOP_REPEAT_LIMIT - 1
+
+    def _jarvis_looping(self, said: str) -> bool:
+        """True when the model is stuck repeating essentially its OWN last replies —
+        end rather than loop forever (live: it asked the business to 'confirm the
+        medication name' ~8 turns running). Complements the callee-side breaker, which
+        is slow when the far end varies its wording; Jarvis's own repeats are near
+        identical, so this catches the stuck model much faster."""
+        # Only a repeated QUESTION is a real dead-end — the model asking the other party
+        # for something it never gets. A repeated STATEMENT is legitimate (declining an
+        # upsell, holding a position) and must NOT trip this (live: it abandoned a pizza
+        # order after Jarvis rightly refused three add-ons). Ignore short acks too.
+        if "?" not in said or len(_normalize_line(said)) < 15:
+            return False
+        repeats = sum(1 for r in self.turn_records if _similar_line(said, r.said))
+        return repeats >= _LOOP_REPEAT_LIMIT - 1
+
+    async def _end_stuck_loop(
+        self, turn_no: int, heard: str, stt_ms: float, t0: float, media_session: Any
+    ) -> np.ndarray | None:
+        """Speak a graceful goodbye and end the call. The outcome carries no
+        [OUTCOME], so the wrapup correctly reports the goal as not achieved."""
+        logger.warning(
+            "Loop-break on turn %d for %s — far end repeated the same line %d "
+            "turns running; ending the call gracefully",
+            turn_no, self.session_id, _LOOP_REPEAT_LIMIT,
+        )
+        pcm, tts_ttfb_ms = await self._speak_sentence(LOOP_BREAK_GOODBYE_LINE)
+        said = LOOP_BREAK_GOODBYE_LINE
+        self.messages.append({"role": "assistant", "content": said})
+        media_session.request_hangup()
+        self._record_turn(
+            turn_no, heard, said, stt_ms, None, tts_ttfb_ms, t0, ["loop_break", "hangup"]
+        )
+        task = asyncio.create_task(self.post_turn_event(self.turn_records[-1]))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return pcm if len(pcm) else None
+
     async def __call__(
         self, utterance_pcm: np.ndarray, media_session: Any
     ) -> np.ndarray | None:
@@ -373,10 +491,19 @@ class LiveTurnPipeline:
 
         heard = await transcribe(utterance_pcm, self.whisper_url, self.http)
         stt_ms = (time.monotonic() - t0) * 1000
-        if not heard:
+        # Empty, or a whisper non-speech marker only ([BLANK_AUDIO]/(silence)) — treat as
+        # silence: no reply. After a deferred hangup this lets the idle timer end the call
+        # instead of the model answering the void with another goodbye.
+        if not heard or _is_non_speech(heard):
             return None
         # Directive re-asserted per turn; the transcript records `heard` raw.
         self.messages.append({"role": "user", "content": with_no_think(heard)})
+
+        # Deterministic loop-breaker: if the far end has repeated essentially the
+        # same line the last few turns, we are stuck (an automated menu we cannot
+        # navigate, or a dead-end). End gracefully rather than restate forever.
+        if self._stuck_in_loop(heard):
+            return await self._end_stuck_loop(turn_no, heard, stt_ms, t0, media_session)
 
         # Deterministic scheduling verdict (best-effort; None on a non-time
         # turn or any failure), injected only into this generation.
@@ -429,6 +556,20 @@ class LiveTurnPipeline:
             if extra_said:
                 said = f"{said} {extra_said}".strip()
 
+        # Jarvis-side loop guard: the model is repeating essentially its own reply —
+        # end gracefully instead of saying the same thing again (live pharmacy_refill:
+        # it asked the pharmacy to 'confirm the medication name' ~8 turns running).
+        if not hangup and self._jarvis_looping(said):
+            logger.warning(
+                "Self-loop on turn %d for %s — model repeated its own reply; ending "
+                "gracefully", turn_no, self.session_id,
+            )
+            pcm, tts_ttfb_ms = await self._speak_sentence(LOOP_BREAK_GOODBYE_LINE)
+            said = LOOP_BREAK_GOODBYE_LINE
+            self.messages.append({"role": "assistant", "content": said})
+            hangup = True
+            event_names.append("loop_break_self")
+
         # The goal is not achieved just because the model said it was. Live
         # 2026-07-19 (food order) and 2026-07-20 (appointment): the model
         # recorded the outcome and hung up in the SAME reply, before the
@@ -457,6 +598,25 @@ class LiveTurnPipeline:
             arm = getattr(media_session, "arm_idle_hangup", None)
             if arm is not None:
                 arm()
+
+        # Once the closing has begun, end the call deterministically even if the model
+        # dropped the [HANGUP] token — live (0bc88823) the box model traded "have a great
+        # day" back and forth and never hung up. Checked AFTER the deferral above and
+        # BEFORE _outcome_recorded_earlier is set for THIS turn, so the first-outcome
+        # deferral still gets its one extra exchange. Two triggers:
+        #   - the other party has signed off, or
+        #   - we recorded an outcome on an EARLIER turn and the model is just saying
+        #     goodbye again.
+        if not hangup:
+            # turn_no > 1: a farewell cue on the very FIRST callee turn is a greeting or
+            # STT noise ("Bye. How's it going?"), never a real close — don't hang up on it.
+            if they_closed and turn_no > 1:
+                hangup = True
+                event_names.append("closed_by_callee")
+            elif self._outcome_recorded_earlier and sounds_like_farewell(said):
+                hangup = True
+                event_names.append("closed_out")
+
         if outcome_this_turn:
             self._outcome_recorded_earlier = True
 

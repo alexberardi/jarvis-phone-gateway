@@ -7,3 +7,6 @@ utterances/
 recordings/
 *.wav
 .DS_Store
+
+# Conversation-harness transcripts (may contain scenario data)
+tools/call_sim_out/

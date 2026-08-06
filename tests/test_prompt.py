@@ -9,9 +9,9 @@ from services.prompt import (
 
 SESSION = {
     "id": "sess-1",
-    "initiator_name": "Alex",
+    "initiator_name": "Jordan",
     "goal": "Book a table for 4 on Friday at 7pm",
-    "details": "Party of 4. Friday 7pm preferred. Name: Alex.",
+    "details": "Party of 4. Friday 7pm preferred. Name: Jordan.",
     "constraints": "acceptable: Fri 6-8pm; conflict: Fri 6:30",
 }
 
@@ -19,7 +19,7 @@ SESSION = {
 class TestDisclosure:
     def test_names_the_user_and_mentions_ai_and_recording(self):
         d = build_disclosure(SESSION)
-        assert "Alex" in d
+        assert "Jordan" in d
         assert "AI assistant" in d
         assert "recorded" in d
 
@@ -79,13 +79,15 @@ class TestDisclosureRules:
     a spoken-output guard is the deterministic backstop.
     """
 
-    def test_refusal_is_the_default_not_hanging_up(self):
-        """We spent 2026-07-20 fixing an agent that hung up too eagerly.
-        Pressure must escalate to a hangup, not jump straight there."""
+    def test_missing_info_and_dead_end_handling_present(self):
+        """A missing detail => don't fabricate; a real dead-end => exit politely
+        with [HANGUP]. (The verbose 'decline twice' / circles / IVR rules are now
+        enforced deterministically in the pipeline, so the prompt just states the
+        core judgement.)"""
         prompt = build_system_prompt({"goal": "book a table"})
 
         assert "say you do not have it" in prompt
-        assert "Decline twice before you do this" in prompt
+        assert "cannot make progress" in prompt and "[HANGUP]" in prompt
 
     def test_give_if_asked_is_never_volunteered(self):
         prompt = build_system_prompt({"goal": "book a table"}).lower()
