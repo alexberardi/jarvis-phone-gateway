@@ -6,9 +6,14 @@ FROM python:3.11-slim@sha256:a3ab0b966bc4e91546a033e22093cb840908979487a9fc0e6e3
 
 WORKDIR /app
 
-# numpy/scipy ship manylinux wheels — no apt build deps needed.
+# git is required to pip-install jarvis-config-client from its git+https URL (used
+# for config-service discovery). numpy/scipy ship manylinux wheels, so no compiler
+# is needed — just git.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY audio /app/audio
 COPY llm /app/llm
