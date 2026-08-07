@@ -50,3 +50,38 @@ class TestAuthUrl:
     def test_default_when_unset(self, monkeypatch):
         _clear(monkeypatch, AUTH_KEYS)
         assert GatewayConfig().auth_url == "http://localhost:7701"
+
+
+PUBLIC_KEYS = ("PHONE_GATEWAY_PUBLIC_WSS_URL", "PUBLIC_WSS_URL", "PUBLIC_URL")
+
+
+class TestPublicWssUrl:
+    """The media-stream break of 2026-08-07: the compose emits
+    PHONE_GATEWAY_PUBLIC_WSS_URL, but the gateway read PUBLIC_WSS_URL/PUBLIC_URL —
+    so both were empty, the TwiML <Stream> URL was blank, Twilio never opened the
+    media socket, and calls hung up with no audio ("no media stream within 60s").
+    """
+
+    def test_reads_generator_wss_name_and_derives_https_public_url(self, monkeypatch):
+        _clear(monkeypatch, PUBLIC_KEYS)
+        monkeypatch.setenv("PHONE_GATEWAY_PUBLIC_WSS_URL", "wss://calls.jarvisautomation.io")
+        c = GatewayConfig()
+        assert c.public_wss_url == "wss://calls.jarvisautomation.io"   # TwiML <Stream> url
+        assert c.public_url == "https://calls.jarvisautomation.io"     # derived signature base
+
+    def test_public_wss_url_legacy_fallback(self, monkeypatch):
+        _clear(monkeypatch, PUBLIC_KEYS)
+        monkeypatch.setenv("PUBLIC_WSS_URL", "wss://legacy.example.io")
+        assert GatewayConfig().public_wss_url == "wss://legacy.example.io"
+
+    def test_explicit_public_url_wins_and_derives_wss(self, monkeypatch):
+        _clear(monkeypatch, PUBLIC_KEYS)
+        monkeypatch.setenv("PUBLIC_URL", "https://gw.example.io")
+        c = GatewayConfig()
+        assert c.public_url == "https://gw.example.io"
+        assert c.public_wss_url == "wss://gw.example.io"  # derived from public_url
+
+    def test_empty_when_nothing_set(self, monkeypatch):
+        _clear(monkeypatch, PUBLIC_KEYS)
+        c = GatewayConfig()
+        assert c.public_url == "" and c.public_wss_url == ""
