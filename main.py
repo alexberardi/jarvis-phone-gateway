@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Awaitable, Callable
 
 import numpy as np
@@ -73,27 +74,50 @@ def _setup_jarvis_logging() -> None:
 
 
 def _discover_service_urls(cfg: GatewayConfig) -> None:
-    """Best-effort config-service discovery; env values are the fallback."""
-    try:
-        from jarvis_config_client import get_service_url  # type: ignore
+    """Resolve upstream service URLs from jarvis-config-service — the same discovery
+    the rest of the stack uses (see command-center's service_config) — filling in
+    anything not pinned by an explicit env override.
 
-        for attr, name in (
-            ("cc_base_url", "jarvis-command-center"),
-            ("whisper_url", "jarvis-whisper-api"),
-            ("llm_url", "jarvis-llm-proxy-api"),
-            ("tts_url", "jarvis-tts"),
-        ):
-            try:
-                url = get_service_url(name)
-                if url:
-                    setattr(cfg, attr, url.rstrip("/"))
-            except Exception:  # noqa: BLE001 — per-service fallback to env
-                pass
-        logger.info("Service discovery applied (config-service)")
+    Env wins over discovery: e.g. ``cc_base_url`` stays whatever
+    ``JARVIS_COMMAND_CENTER_BASE_URL`` / ``CC_BASE_URL`` set it to, so an operator can
+    force command-center onto an internal address. Everything else
+    (whisper/llm/tts) is left unset in the compose, so it comes from discovery.
+
+    Best-effort throughout: a missing client, an unreachable config-service, or a
+    per-service miss all leave the env/default value in place — the gateway never
+    fails to boot over discovery.
+    """
+    try:
+        from jarvis_config_client import init as config_init, get_service_url  # type: ignore
     except ImportError:
         logger.info("jarvis-config-client not installed — using env URLs")
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Service discovery failed (env URLs stand): %s", e)
+        return
+
+    try:
+        # init() reads JARVIS_CONFIG_URL (else auto-discovers); 5-min bg refresh.
+        # Without it, get_service_url raises "not initialized" — the bug that made
+        # this whole function a silent no-op before.
+        config_init(refresh_interval_seconds=300)
+    except Exception as e:  # noqa: BLE001 — discovery is best-effort
+        logger.warning("config-service discovery unavailable (env URLs stand): %s", e)
+        return
+
+    # (cfg attr, service name, env var(s) that PIN the value over discovery)
+    for attr, name, pin_envs in (
+        ("cc_base_url", "jarvis-command-center", ("JARVIS_COMMAND_CENTER_BASE_URL", "CC_BASE_URL")),
+        ("whisper_url", "jarvis-whisper-api", ("WHISPER_URL",)),
+        ("llm_url", "jarvis-llm-proxy-api", ("LLM_URL",)),
+        ("tts_url", "jarvis-tts", ("TTS_URL",)),
+    ):
+        if any(os.getenv(e) for e in pin_envs):
+            continue  # explicit override wins — don't overwrite with discovery
+        try:
+            url = get_service_url(name)
+            if url:
+                setattr(cfg, attr, url.rstrip("/"))
+        except Exception:  # noqa: BLE001 — per-service fallback to env/default
+            pass
+    logger.info("Service discovery applied (config-service)")
 
 
 async def _silent_turn_pipeline(

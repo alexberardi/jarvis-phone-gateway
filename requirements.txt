@@ -6,3 +6,8 @@ scipy>=1.12
 python-dotenv>=1.0
 redis>=5.0
 boto3>=1.34
+# Service discovery: resolve upstream URLs (whisper/llm/tts/command-center) from
+# jarvis-config-service instead of hardcoding env URLs per service. Optional at
+# import (main.py._discover_service_urls degrades to env URLs if absent), but
+# shipped so discovery is the default. Pinned to match the rest of the stack.
+jarvis-config-client @ git+https://github.com/alexberardi/jarvis-config-client.git@c1c8903
