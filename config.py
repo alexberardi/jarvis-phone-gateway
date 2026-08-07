@@ -24,7 +24,15 @@ class GatewayConfig:
     # tunnels; see PRD infra prereq). Signature validation reconstructs the
     # request URL against this base.
     public_url: str = field(default_factory=lambda: os.getenv("PUBLIC_URL", "").rstrip("/"))
-    cc_base_url: str = field(default_factory=lambda: os.getenv("CC_BASE_URL", "http://localhost:7703"))
+    # Command-center base. Ecosystem-standard name is JARVIS_COMMAND_CENTER_BASE_URL
+    # (mirrors JARVIS_AUTH_BASE_URL; what the admin/installer compose generators emit
+    # for services that depend on jarvis-command-center). CC_BASE_URL kept as a
+    # backward-compat fallback for older .envs.
+    cc_base_url: str = field(
+        default_factory=lambda: os.getenv("JARVIS_COMMAND_CENTER_BASE_URL")
+        or os.getenv("CC_BASE_URL")
+        or "http://localhost:7703"
+    )
     whisper_url: str = field(default_factory=lambda: os.getenv("WHISPER_URL", "http://localhost:7706"))
     llm_url: str = field(default_factory=lambda: os.getenv("LLM_URL", "http://localhost:7704"))
     tts_url: str = field(default_factory=lambda: os.getenv("TTS_URL", "http://localhost:7707"))
@@ -34,7 +42,14 @@ class GatewayConfig:
     host: str = field(default_factory=lambda: os.getenv("SERVER_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: int(os.getenv("SERVER_PORT", "7713")))
     vad_rms: float = field(default_factory=lambda: float(os.getenv("VAD_RMS", "250")))
-    auth_url: str = field(default_factory=lambda: os.getenv("JARVIS_AUTH_URL", "http://localhost:7701"))
+    # jarvis-auth base. Ecosystem-standard name is JARVIS_AUTH_BASE_URL (what the
+    # compose generators emit for auth-dependent services); JARVIS_AUTH_URL kept as a
+    # backward-compat fallback.
+    auth_url: str = field(
+        default_factory=lambda: os.getenv("JARVIS_AUTH_BASE_URL")
+        or os.getenv("JARVIS_AUTH_URL")
+        or "http://localhost:7701"
+    )
     # Explicit wss base for TwiML, else derived from public_url (https→wss).
     _public_wss_url: str = field(
         default_factory=lambda: os.getenv("PUBLIC_WSS_URL", "").rstrip("/")
