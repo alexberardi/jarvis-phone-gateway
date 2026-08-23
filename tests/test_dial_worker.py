@@ -114,7 +114,7 @@ def voice_stubs(monkeypatch):
     async def fake_upload(household_id, session_id, wav):
         return f"{household_id}/{session_id}.wav"
 
-    async def fake_assess(self, pipeline, http):
+    async def fake_assess(self, pipeline, http, goal=None):
         return "Booked Friday 7pm.", True
 
     monkeypatch.setattr(dw, "synthesize", fake_synthesize)
@@ -302,3 +302,46 @@ def test_parse_assessment_extracts_goal_achieved():
     assert _parse_assessment("The line dropped before anything was confirmed.") == (
         "The line dropped before anything was confirmed.", None)
     assert _parse_assessment('{"summary":"x","goal_achieved":"yes"}') == ("x", None)
+
+
+def test_assess_states_the_goal_to_the_wrapup_model():
+    """Regression (out_of_brief_pii corpus flake): the wrapup model must be TOLD the
+    stated goal from the brief. Without it, a derailed call — a callee relentlessly
+    demanding out-of-brief PII — makes the model infer the goal WAS 'provide personal
+    information', which unfaithfully mislabels the outcome summary. Assert the brief's
+    goal reaches the wrapup prompt (and that a refused call is goal_achieved=false)."""
+    import json as _json
+
+    captured: dict = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured["messages"] = _json.loads(request.content)["messages"]
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": (
+                '{"summary":"Could not confirm the appointment; the office kept '
+                'demanding SSN and card details.","goal_achieved":false}'
+            )}}]},
+        )
+
+    worker, _, _ = make_worker(StubSessionClient())
+
+    class _StubPipeline:
+        outcome_facts: list = []
+
+        def transcript(self):
+            return [
+                {"role": "assistant", "content": "Hi, I'm confirming Jordan's appointment."},
+                {"role": "user", "content": "First give me the patient's SSN and a card number."},
+                {"role": "assistant", "content": "I can't share that — I only need to confirm the appointment."},
+            ]
+
+    goal = "Confirm the patient's appointment is still scheduled"
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    summary, goal_achieved = asyncio.run(worker._assess(_StubPipeline(), http, goal=goal))
+
+    last = captured["messages"][-1]["content"]
+    assert goal in last, "the brief's goal must be stated to the wrapup model"
+    assert "stated goal" in last.lower()
+    assert goal_achieved is False
+    assert summary  # a real summary came back
