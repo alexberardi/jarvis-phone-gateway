@@ -67,6 +67,8 @@ _SUMMARY_INSTRUCTION = (
     "business still needed information the assistant did not give (for example: the "
     "assistant said 'I'll proceed with the refill' but the business said it still "
     "needed the prescription — that is goal_achieved=false). When in doubt, false. "
+    "Describe the goal as the STATED goal given above (when present) — never as "
+    "whatever the other party demanded or steered the call toward. "
     "Do not invent details. /no_think"
 )
 
@@ -341,7 +343,9 @@ class DialWorker:
         await self._state_quietly(session_id, "wrapup", http)
         pipeline = runtime.pipeline
 
-        summary, goal_achieved = await self._assess(pipeline, http)
+        summary, goal_achieved = await self._assess(
+            pipeline, http, goal=session.get("goal")
+        )
 
         audio_key: str | None = None
         if runtime.recorder is not None:
@@ -371,16 +375,29 @@ class DialWorker:
             logger.error("Outcome/done report failed for %s: %s", session_id, e)
 
     async def _assess(
-        self, pipeline: LiveTurnPipeline, http: httpx.AsyncClient
+        self,
+        pipeline: LiveTurnPipeline,
+        http: httpx.AsyncClient,
+        goal: str | None = None,
     ) -> tuple[str, bool | None]:
         """Post-call assessment on the background model → (summary, goal_achieved).
         goal_achieved is the STRUCTURED success verdict downstream keys on; None when
         the model is unavailable or its verdict can't be parsed (→ conservative
-        fail-fast). Honest fallback summary."""
+        fail-fast). Honest fallback summary.
+
+        ``goal`` is the caller's brief goal. Stating it explicitly stops the wrapup
+        model from INFERRING the goal off a derailed transcript — e.g. a callee that
+        kept demanding out-of-brief info, which otherwise makes the model report the
+        goal as 'provide personal information' instead of the real goal."""
         transcript = pipeline.transcript()
         if not transcript:
             return "The call ended before any conversation took place.", False
-        messages = transcript + [{"role": "user", "content": _SUMMARY_INSTRUCTION}]
+        goal = (goal or "").strip()
+        instruction = (
+            f"The stated goal of this call (from the caller's brief) was: {goal}\n\n"
+            + _SUMMARY_INSTRUCTION
+        ) if goal else _SUMMARY_INSTRUCTION
+        messages = transcript + [{"role": "user", "content": instruction}]
         try:
             r = await http.post(
                 f"{self.cfg.llm_url.rstrip('/')}/v1/chat/completions",
