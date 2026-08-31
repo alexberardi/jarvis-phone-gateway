@@ -109,3 +109,41 @@ class TestDisclosureRules:
         prompt = build_system_prompt({"goal": "book a table"})
 
         assert "payment card numbers" in prompt
+
+
+class TestSpellingScope:
+    """Letter-by-letter delivery is for names and IDs — not ordinary words.
+
+    Live call, 2026-08-31: Jarvis read times back as "A as in Alpha, M as in
+    Mike" / "P as in Papa, M as in Mike" on every AM/PM, and on a call that
+    lists several candidate times it does it over and over. The spelling rule
+    said "say each letter separately" and carried a NATO-style correction
+    example ("that's B as in Boy, not P"), and the model generalised both onto
+    times and short words.
+
+    The rule has to stay — spelling a surname and reading a member ID digit by
+    digit is exactly what makes these calls work — so this scopes it instead of
+    weakening it.
+    """
+
+    def test_times_are_spoken_not_spelled(self):
+        p = build_system_prompt(SESSION)
+        low = p.lower()
+        assert "am/pm" in low or "a.m./p.m." in low, (
+            "the prompt must explicitly name AM/PM as speak-normally"
+        )
+        assert "never spell out" in low or "do not spell out" in low
+
+    def test_phonetic_form_is_scoped_to_corrections(self):
+        p = build_system_prompt(SESSION)
+        # The "X as in Y" device may only appear as a correction device, and the
+        # prompt must say so rather than leaving the model to infer it.
+        assert "as in" in p
+        assert "only" in p.lower()
+
+    def test_spelling_rule_still_applies_to_names_and_ids(self):
+        p = build_system_prompt(SESSION)
+        low = p.lower()
+        assert "each letter" in low
+        assert "each digit" in low
+        assert "spell the real name" in low
